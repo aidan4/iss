@@ -237,7 +237,7 @@ static void slide_tick(CFRunLoopTimerRef timer, void *context) {
     (void)timer; (void)context;
     if (!slide_still_valid()) { abort_slide(); return; }
     double elapsed = now_seconds() - animation.started;
-    if (elapsed >= ISS_INITIAL_SLIDE_SECONDS) { finish_slide(); return; }
+    if (elapsed >= ISS_SLIDE_SECONDS) { finish_slide(); return; }
     if (!post_slide_frame(animation.source, SwipeChange,
                          slide_position(animation.from, animation.target, elapsed), 0))
         finish_slide();
@@ -267,13 +267,13 @@ static bool start_slide(CGEventRef source, SwipeEvent output) {
     }
     // Divide the duration into whole frames so the last tick lands on the
     // deadline rather than rounding a 60 ms animation up to 66.7 ms.
-    double interval = ISS_INITIAL_SLIDE_SECONDS / ceil(ISS_INITIAL_SLIDE_SECONDS * 120);
+    double interval = ISS_SLIDE_SECONDS / ceil(ISS_SLIDE_SECONDS * 120);
     animation.timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + interval,
                                          interval, 0, 0, slide_tick, NULL);
     if (!animation.timer) { dispose_slide(); return false; }
     CFRunLoopAddTimer(CFRunLoopGetMain(), animation.timer, kCFRunLoopCommonModes);
     if (verbose) fprintf(stderr, "slide started from=%+.6f target=%+.6f duration_ms=%.0f\n",
-                         animation.from, animation.target, ISS_INITIAL_SLIDE_SECONDS * 1000);
+                         animation.from, animation.target, ISS_SLIDE_SECONDS * 1000);
     return true;
 }
 
@@ -330,7 +330,7 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
             finish_slide();
         } else {
             if (input.phase == SwipeChange) {
-                swipe.pending += input.progress - swipe.last;
+                swipe_accumulate_pending(&swipe, input.progress - swipe.last);
                 swipe.last = input.progress;
             } else if (input.phase == SwipeEnd || input.phase == SwipeCancel) {
                 swipe.active = false;
@@ -364,8 +364,9 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
         }
     }
     if (!output.drop && output.phase == SwipeEnd && output.velocity != 0 &&
-        swipe.mode == SwipeWaiting && !swipe.paging && !swipe.passthrough &&
+        swipe.mode == SwipeWaiting && !swipe.passthrough &&
         start_slide(ev, output)) {
+        // Animate every committed segment, including continued-drag paging.
         // Keep the native gesture open while timed Changed frames complete
         // the visible slide. The timer supplies its terminal event at the animation deadline.
         output.phase = SwipeChange;

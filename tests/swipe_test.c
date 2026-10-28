@@ -21,10 +21,10 @@ int main(void) {
     near(slide_target(3,1),1.5);
     near(slide_target(4,-1),-4.0/3);
     near(slide_position(.2,1.5,0),.2);
-    near(slide_position(.2,1.5,ISS_INITIAL_SLIDE_SECONDS / 2),.85);
-    near(slide_position(.2,1.5,ISS_INITIAL_SLIDE_SECONDS),1.5);
+    near(slide_position(.2,1.5,ISS_SLIDE_SECONDS / 2),.85);
+    near(slide_position(.2,1.5,ISS_SLIDE_SECONDS),1.5);
     near(slide_position(.2,1.5,.2),1.5);
-    near(slide_position(-.2,-1.5,ISS_INITIAL_SLIDE_SECONDS / 2),-.85);
+    near(slide_position(-.2,-1.5,ISS_SLIDE_SECONDS / 2),-.85);
     for(int direction=-1;direction<=1;direction+=2) {
         start(&s,2,5);
         e=move(&s,direction*.15,.05,2);
@@ -57,16 +57,16 @@ int main(void) {
     e=move(&s,.5,.22,0); assert(e.drop && s.index==0);
     e=move(&s,.55,.24,1); assert(e.drop && s.index==1);
     e=move(&s,.6,.3,1); assert(e.drop); // Centered; no premature next preview.
-    e=move(&s,.65,.37,1); assert(e.phase==SwipeBegin); near(e.progress,0);
-    e=move(&s,.67,.38,1); assert(e.phase==SwipeChange); near(e.progress,.0001);
-    e=move(&s,.7,.39,1); assert(e.phase==SwipeEnd && s.target==2);
+    e=move(&s,.65,.40,1); assert(e.phase==SwipeBegin); near(e.progress,0);
+    e=move(&s,.67,.41,1); assert(e.phase==SwipeChange); near(e.progress,.0001);
+    e=move(&s,.7,.42,1); assert(e.phase==SwipeEnd && s.target==2);
     near(e.velocity,ISS_FINISH_VELOCITY);
     near(e.progress,.0001);
-    e=move(&s,.75,.42,2); assert(e.drop && s.index==2);
-    e=move(&s,.76,.55,2); assert(e.phase==SwipeBegin);
-    e=move(&s,.77,.56,2); assert(e.phase==SwipeChange);
-    e=move(&s,.78,.57,2); assert(e.phase==SwipeEnd && s.target==3);
-    e=move(&s,.8,.6,3); assert(e.drop && s.index==3);
+    e=move(&s,.75,.45,2); assert(e.drop && s.index==2);
+    e=move(&s,.76,.61,2); assert(e.phase==SwipeBegin);
+    e=move(&s,.77,.62,2); assert(e.phase==SwipeChange);
+    e=move(&s,.78,.63,2); assert(e.phase==SwipeEnd && s.target==3);
+    e=move(&s,.8,.66,3); assert(e.drop && s.index==3);
     e=move(&s,2,.8,3); assert(e.drop); // Edge overshoot discarded.
     e=move(&s,1.7,.95,3); assert(e.phase==SwipeBegin);
     e=move(&s,1.65,.96,3); near(e.progress,-.0001);
@@ -103,6 +103,42 @@ int main(void) {
     start(&s,1,3); move(&s,.1,.05,1);
     e=swipe_move(&s,frame(SwipeChange,.2,0),.1,1,false);
     assert(e.phase==SwipeCancel);
+    // Continued travel uses the wider distance and longer centered dwell.
+    s=(Swipe){.index=2,.count=5,.target=-1,.mode=SwipeBetween,.active=true,
+              .last_direction=1,.pending_direction=1,.centered_since=1};
+    e=move(&s,.15,1.2,2); assert(e.drop); // Old 0.125 threshold no longer enough.
+    e=move(&s,.17,1.21,2); assert(e.phase==SwipeBegin);
+    s=(Swipe){.index=2,.count=5,.target=-1,.mode=SwipeBetween,.active=true,
+              .last_direction=1,.pending_direction=1,.centered_since=1};
+    e=move(&s,.2,1.13,2); assert(e.drop); // Old 120 ms pause no longer enough.
+    e=move(&s,.21,1.16,2); assert(e.phase==SwipeBegin);
+
+    // Reversal while the slide is playing discards a large forward backlog.
+    // It still waits for the actual landing, then bypasses the centered dwell
+    // and the long-drag delay, in either direction.
+    for(int direction=-1; direction<=1; direction+=2) {
+        start(&s,2,5);
+        move(&s,direction*.02,.01,2);
+        e=move(&s,direction*.1,.05,2); assert(e.phase==SwipeEnd);
+        swipe_accumulate_pending(&s,direction*.9); s.last+=direction*.9;
+        swipe_accumulate_pending(&s,-direction*.01); s.last-=direction*.01;
+        assert(s.pending*direction>0 && s.pending_direction==direction);
+        swipe_accumulate_pending(&s,-direction*.04); s.last-=direction*.04;
+        near(s.pending,-direction*.05); // No need to unwind the prior 0.9 travel.
+        e=move(&s,direction*.95,.06,2); assert(e.drop);
+        e=move(&s,direction*.95,.07,2+direction);
+        assert(e.phase==SwipeBegin && s.fast_reverse);
+        e=move(&s,direction*.94,.08,2+direction); assert(e.phase==SwipeChange);
+        e=move(&s,direction*.93,.09,2+direction);
+        assert(e.phase==SwipeEnd && s.target==2);
+        assert(e.velocity*direction<0);
+    }
+    // Small back-and-forth jitter cannot change direction or discard travel.
+    s=(Swipe){.pending=.5,.last_direction=1,.pending_direction=1};
+    swipe_accumulate_pending(&s,-.01);
+    swipe_accumulate_pending(&s,.02);
+    near(s.pending,.51); assert(s.pending_direction==1 && s.reverse_travel==0);
+
     // Nonzero Began must not start an edge rubber-band. A reversed release
     // (including a discrete swipe without Changed) must not fling backwards.
     for(int direction=-1;direction<=1;direction+=2) {

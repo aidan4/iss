@@ -2,13 +2,13 @@
 #define ISS_SLIDE_H
 #include <math.h>
 #include <stdbool.h>
-#define ISS_INITIAL_SLIDE_SECONDS 0.060
+#define ISS_SLIDE_SECONDS 0.060
 // FasterSwiper's space-state conversion: N/(N-1) progress per full space.
 static inline double slide_target(int spaces, double direction) {
     return spaces > 1 ? copysign((double)spaces / (spaces - 1), direction) : 0;
 }
 static inline double slide_position(double start, double target, double elapsed) {
-    double t = fmax(0, fmin(1, elapsed / ISS_INITIAL_SLIDE_SECONDS));
+    double t = fmax(0, fmin(1, elapsed / ISS_SLIDE_SECONDS));
     return start + (target - start) * t;
 }
 // The active space may become the target before the final frame commits.

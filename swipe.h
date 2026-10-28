@@ -4,10 +4,11 @@
 #include <stdbool.h>
 #include <math.h>
 
-#define ISS_SPACE_DISTANCE 0.125
+#define ISS_SPACE_DISTANCE 0.16
+#define ISS_REVERSE_DISTANCE 0.04
 #define ISS_INITIAL_TRIGGER_DISTANCE 0.0625
 #define ISS_INITIAL_TRIGGER_SECONDS 0.04
-#define ISS_CENTER_SECONDS 0.12
+#define ISS_CENTER_SECONDS 0.15
 #define ISS_LONG_SWIPE_SECONDS 0.18
 #define ISS_FLICK_VELOCITY 0.08
 #define ISS_EDGE_REVERSAL_DISTANCE 0.04
@@ -22,10 +23,10 @@ typedef struct {
     bool drop;
 } SwipeEvent;
 typedef struct {
-    int index, count, target;
+    int index, count, target, last_direction, pending_direction;
     enum SwipeMode mode;
-    double started, waiting_since, last, position, pending, centered_since, edge_travel;
-    bool active, open, changed, rebased, passthrough, paging, edge_blocked;
+    double started, waiting_since, last, position, pending, centered_since, edge_travel, reverse_travel;
+    bool active, open, changed, rebased, passthrough, paging, edge_blocked, fast_reverse;
 } Swipe;
 
 // Native events already include the scroll preference. On 26 AND 27 positive
@@ -51,6 +52,27 @@ static inline SwipeEvent swipe_zero(SwipeEvent e) {
     return e;
 }
 
+// Track movement direction independently of accumulated forward distance.
+// A deliberate reversal discards that backlog instead of making the fingers
+// drag all the way back through it. Tiny jitter merely pauses forward paging.
+static inline void swipe_accumulate_pending(Swipe *s, double delta) {
+    if (!isfinite(delta) || delta == 0) return;
+    if (!s->pending_direction)
+        s->pending_direction = s->last_direction ? s->last_direction : (delta > 0 ? 1 : -1);
+    if (delta * s->pending_direction < 0) {
+        s->reverse_travel += fabs(delta);
+        if (s->reverse_travel >= ISS_REVERSE_DISTANCE) {
+            s->pending_direction = -s->pending_direction;
+            s->pending = s->pending_direction * s->reverse_travel;
+            s->reverse_travel = 0;
+            return;
+        }
+    } else {
+        s->reverse_travel = 0;
+    }
+    s->pending += delta;
+}
+
 // Preserve a pending confirmation across quick successive physical gestures.
 // The caller resets this state if the display or ordered space IDs change.
 static inline SwipeEvent swipe_begin(Swipe *s, SwipeEvent e, int index, int count, double now) {
@@ -71,6 +93,7 @@ static inline SwipeEvent swipe_begin(Swipe *s, SwipeEvent e, int index, int coun
     if (waiting) {
         s->mode = SwipeWaiting;
         s->target = target;
+        s->last_direction = s->pending_direction = target > index ? 1 : -1;
         s->waiting_since = waiting_since;
         s->open = false;
         s->rebased = true;
@@ -104,7 +127,7 @@ static inline SwipeEvent swipe_move(Swipe *s, SwipeEvent e, double now,
     double delta = e.progress - s->last;
     s->last = e.progress;
     if (s->mode == SwipeWaiting || s->mode == SwipeBetween) {
-        s->pending += delta;
+        swipe_accumulate_pending(s, delta);
         if (s->mode == SwipeWaiting) {
             if (observed_index == s->target) {
                 s->index = observed_index; // Only advance after the Dock confirms.
@@ -124,8 +147,11 @@ static inline SwipeEvent swipe_move(Swipe *s, SwipeEvent e, double now,
         }
         // Once the first preview has landed, keep the current space centered.
         // Require both fresh travel and a short dwell before another page.
-        if (fabs(s->pending) < ISS_SPACE_DISTANCE ||
-            now - s->centered_since < ISS_CENTER_SECONDS) return swipe_drop(e);
+        bool reversing = s->last_direction && s->pending_direction != s->last_direction;
+        double distance = reversing ? ISS_REVERSE_DISTANCE : ISS_SPACE_DISTANCE;
+        if (s->reverse_travel > 0 || fabs(s->pending) < distance ||
+            (!reversing && now - s->centered_since < ISS_CENTER_SECONDS)) return swipe_drop(e);
+        s->fast_reverse = reversing;
         s->paging = true;
         s->position = s->pending;
         s->pending = 0;
@@ -171,12 +197,16 @@ static inline SwipeEvent swipe_move(Swipe *s, SwipeEvent e, double now,
     // back-to-back, or predict several switches the Dock hasn't processed yet.
     // Start the first slide sooner; continued paging retains its own travel
     // threshold and timing so this does not increase multi-space sensitivity.
-    double trigger_distance = s->paging ? ISS_SPACE_DISTANCE : ISS_INITIAL_TRIGGER_DISTANCE;
-    double trigger_seconds = s->paging ? ISS_LONG_SWIPE_SECONDS : ISS_INITIAL_TRIGGER_SECONDS;
+    double trigger_distance = s->fast_reverse ? ISS_REVERSE_DISTANCE :
+                              s->paging ? ISS_SPACE_DISTANCE : ISS_INITIAL_TRIGGER_DISTANCE;
+    double trigger_seconds = s->fast_reverse ? 0 :
+                             s->paging ? ISS_LONG_SWIPE_SECONDS : ISS_INITIAL_TRIGGER_SECONDS;
     if (s->changed && now - s->started >= trigger_seconds &&
         fabs(s->position) >= trigger_distance) {
         double direction = copysign(1, s->position);
         s->target = s->index + (int)direction;
+        s->last_direction = s->pending_direction = (int)direction;
+        s->reverse_travel = 0;
         s->pending = s->position - direction * trigger_distance;
         s->mode = SwipeWaiting;
         s->waiting_since = now;
@@ -222,6 +252,8 @@ static inline SwipeEvent swipe_finish(Swipe *s, SwipeEvent e, double now) {
     if (direction != 0 && direction * s->position >= 0) {
         e.velocity = direction * ISS_FINISH_VELOCITY;
         s->target = s->index + (int)direction;
+        s->last_direction = s->pending_direction = (int)direction;
+        s->reverse_travel = 0;
         s->mode = SwipeWaiting;
         s->waiting_since = now;
         s->pending = 0;
