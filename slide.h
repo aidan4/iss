@@ -2,7 +2,8 @@
 #define ISS_SLIDE_H
 #include <math.h>
 #include <stdbool.h>
-#define ISS_SLIDE_SECONDS 0.060
+#include "settings.h"
+#define ISS_SLIDE_SECONDS iss_settings.slideSeconds
 // FasterSwiper's space-state conversion: N/(N-1) progress per full space.
 static inline double slide_target(int spaces, double direction) {
     return spaces > 1 ? copysign((double)spaces / (spaces - 1), direction) : 0;

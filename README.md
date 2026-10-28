@@ -11,7 +11,7 @@ Keeps the native finger-following preview when swiping between macOS spaces, acc
 - Outward gestures at the first or last space are suppressed from Begin through End. A deliberate inward reversal can start a new segment; release jitter cannot fling back to the previous space.
 - Vertical swipes, including Mission Control and App Exposé, pass through.
 
-The gesture thresholds live in `swipe.h`; the slide duration lives in `slide.h`. Distances use native gesture progress units, not pixels.
+These are the default settings. The native app lets you change them without rebuilding. Distances use native gesture progress units, not pixels.
 
 ## How it works
 
@@ -34,18 +34,54 @@ No SIP disable or code injection is required. The event fields and CGS space API
 ```
 make
 make test
+make test-app
 ```
 
-Tests cover both native directions, preview and release progress, first/last-space clamping, reversal, confirmed multi-space drags, delayed or failed landings, rapid subsequent gestures, cancellation, and single-space displays. The CGEvent tests check serialized native events, embedded phase/velocity updates, insertion of missing velocity children, opposite payload signs, and overflow prevention without posting gestures to the desktop.
+Tests cover both native directions, preview and release progress, first/last-space clamping, reversal, confirmed multi-space drags, delayed or failed landings, rapid subsequent gestures, cancellation, and single-space displays. Settings tests cover clamping and invalid files, altered gesture thresholds, persistence, reset, and app pause/resume/quit using a harmless dummy helper. The CGEvent tests check serialized native events, embedded phase/velocity updates, insertion of missing velocity children, opposite payload signs, and overflow prevention without posting gestures to the desktop.
 
-## Install
+## Native settings app and menu bar
 
+```sh
+make app
+open build/ISS.app
 ```
-# builds, installs to ~/.local/bin/iss, starts launch agent
+
+The settings window has three pages:
+
+- **Swiping:** slide duration, activation distance and delay, and flick sensitivity. Try Slide previews the timing without changing your desktop.
+- **Long drags:** distance per space, centered pause, long-drag delay, reversal distance, and inward reversal distance at an edge.
+- **General:** launch at login, Accessibility permission, switcher status, restart, and local diagnostics.
+
+Changes save automatically and apply between physical gestures, after any current slide finishes. Every setting has a reset button; Restore Defaults returns to the tuning above. Closing the window leaves ISS in the menu bar. The menu offers pause/resume, settings, launch at login, Accessibility settings, and quit. Pausing or quitting returns gestures to macOS.
+
+To install the app in `~/Applications` and open it:
+
+```sh
+# If you installed the old command-line background service, remove it first:
+make uninstall
+make install-app
+```
+
+Stop any foreground `./iss` process with Ctrl+C before opening the app. The new engine prevents overlapping instances, and the app detects the legacy launch-agent installation. Grant **ISS** Accessibility access in System Settings → Privacy & Security → Accessibility. If macOS lists **iss-engine** separately, allow that as well. Click Retry if needed. Local builds are ad-hoc signed; macOS may require re-enabling permission after a rebuild.
+
+Enable **Launch at login** in the app once it is in its permanent location. ISS uses macOS’s built-in login-item registration. If approval is required, the app provides a link to Login Items. Turn this setting off before moving or removing the app.
+
+Settings are saved in `~/Library/Application Support/ISS/settings.plist`. The app and engine share their default values and supported ranges through `settings.h`; the app’s schema is generated during the build. The helper validates the file and defers reloads throughout a gesture and its animation. It exits if the app quits or crashes. The app stays offline and does not send diagnostics automatically.
+
+For a UI-only preview with no switcher or Accessibility prompt:
+
+```sh
+build/ISS.app/Contents/MacOS/ISS --preview
+```
+
+## Command-line installation (optional)
+
+```sh
+# Installs ~/.local/bin/iss and starts the original launch agent:
 make install
 ```
 
-Runs automatically at login via launchd. Grant Accessibility permission when prompted.
+Use either this service or the app. The command-line service still uses the original defaults unless started with `--config`. The native app is not required for command-line operation.
 
 ## Diagnostics
 
@@ -55,6 +91,9 @@ With the installed agent stopped, use one foreground instance:
 # Log native input and the changes made by iss:
 ./iss --verbose
 
+# Use settings saved by the app (quit the app first):
+./iss --verbose --config "$HOME/Library/Application Support/ISS/settings.plist"
+
 # Or observe native gestures without modifying them:
 ./iss --probe
 ```
@@ -62,6 +101,8 @@ With the installed agent stopped, use one foreground instance:
 Both modes log horizontal space gestures and space indices; the probe also records their serialized event payloads. Stop with Ctrl+C. Avoid running another space-switching utility at the same time when testing.
 
 ## Uninstall
+
+For the app, disable Launch at login, quit ISS from the menu bar, and remove `~/Applications/ISS.app`. Your settings remain in Application Support. For the command-line service:
 
 ```
 make uninstall

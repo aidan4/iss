@@ -12,6 +12,11 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include "settings_io.h"
 #include "native_event.h"
 #include "iohid.h"
 #include "slide.h"
@@ -395,14 +400,34 @@ static void stop(int signal_number) { (void)signal_number; running = 0; }
 
 #ifndef ISS_TEST
 int main(int argc, char **argv) {
+    const char *config_path = NULL;
+    bool managed = false;
+    pid_t parent = getppid();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--probe")) probe = true;
         else if (!strcmp(argv[i], "--verbose")) verbose = true;
+        else if (!strcmp(argv[i], "--managed")) managed = true;
+        else if (!strcmp(argv[i], "--config") && i + 1 < argc) config_path = argv[++i];
+        else if (!strcmp(argv[i], "--settings-schema")) { settings_print_schema(); return 0; }
         else {
-            fprintf(stderr, "Usage: iss [--verbose | --probe]\n"
+            fprintf(stderr, "Usage: iss [--verbose | --probe] [--config settings.plist]\n"
                     "  --probe   log native horizontal gestures without modifying them\n");
             return !strcmp(argv[i], "--help") ? 0 : 2;
         }
+    }
+    if (config_path && !settings_read(config_path, &iss_settings)) {
+        fprintf(stderr, "iss: unable to read settings file\n"); return 2;
+    }
+    // Both app and CLI copies participate. Never install two modifying taps.
+    char lock_path[128];
+    snprintf(lock_path, sizeof(lock_path), "/tmp/iss-%u.lock", (unsigned)getuid());
+    int lock = open(lock_path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+    struct stat lock_info;
+    if (lock < 0 || fstat(lock, &lock_info) || !S_ISREG(lock_info.st_mode) ||
+        lock_info.st_uid != getuid() || flock(lock, LOCK_EX | LOCK_NB)) {
+        fprintf(stderr, "iss: another copy is running, or the instance lock is unavailable\n");
+        if (lock >= 0) close(lock);
+        return 73;
     }
     char version[32] = {0};
     size_t version_size = sizeof(version);
@@ -427,8 +452,18 @@ int main(int argc, char **argv) {
     signal(SIGINT, stop); signal(SIGTERM, stop);
     fprintf(stderr, "iss: %s (macOS %s, native event path)\n",
             probe ? "read-only gesture probe" : "swipe active", version);
+    double next_settings_check = 0;
     while (running) {
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, true);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, true);
+        if (managed && getppid() != parent) break;
+        // Freeze the settings for the entire physical gesture and its final
+        // animation. In particular, never change the timer duration mid-slide.
+        double now = now_seconds();
+        if (config_path && !swipe.active && !animation.source && now >= next_settings_check) {
+            ISSSettings updated;
+            if (settings_read(config_path, &updated)) iss_settings = updated;
+            next_settings_check = now + 0.25;
+        }
         trusted = AXIsProcessTrusted();
         if (trusted != tap_trusted) {
             dispose_slide();
@@ -446,6 +481,7 @@ int main(int argc, char **argv) {
     CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
     CFRelease(source); CFRelease(tap);
     if (spaces.display) CFRelease(spaces.display);
+    close(lock);
     return 0;
 }
 #endif

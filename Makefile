@@ -11,19 +11,21 @@ PLIST     = $(AGENT_DIR)/$(LABEL).plist
 SDKROOT ?= $(shell xcrun --sdk macosx26.5 --show-sdk-path 2>/dev/null || xcrun --sdk macosx --show-sdk-path 2>/dev/null)
 CFLAGS  ?= -std=c11 -O3 -march=native -pipe -flto -Wall -Wextra -Wpedantic
 ifneq ($(SDKROOT),)
-CFLAGS  += -isysroot $(SDKROOT)
+CFLAGS  += -isysroot $(SDKROOT) -mmacosx-version-min=14.0
 endif
 LDFLAGS  = -framework ApplicationServices -framework CoreFoundation \
            -Wl,-dead_strip -Wl,-dead_strip_dylibs -Wl,-x
 
-$(BIN): iss.c swipe.h native_event.h iohid.h slide.h Makefile
+$(BIN): iss.c swipe.h native_event.h iohid.h slide.h settings.h settings_io.h Makefile
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-test: tests/swipe_test.c tests/native_event_test.c swipe.h native_event.h iohid.h slide.h
+test: tests/swipe_test.c tests/native_event_test.c tests/settings_test.c swipe.h native_event.h iohid.h slide.h settings.h settings_io.h
 	$(CC) $(CFLAGS) -o /tmp/iss-swipe-test tests/swipe_test.c
 	/tmp/iss-swipe-test
 	$(CC) $(CFLAGS) -o /tmp/iss-native-event-test tests/native_event_test.c $(LDFLAGS)
 	/tmp/iss-native-event-test
+	$(CC) $(CFLAGS) -o /tmp/iss-settings-test tests/settings_test.c $(LDFLAGS)
+	/tmp/iss-settings-test
 
 lint: iss.c
 	cppcheck --enable=warning,style,performance --error-exitcode=1 iss.c
@@ -61,5 +63,48 @@ uninstall:
 
 clean:
 	rm -f $(BIN)
+	rm -rf build
 
 .PHONY: install uninstall clean lint test
+
+APP = build/ISS.app
+APP_INSTALL_DIR ?= $(HOME)/Applications
+SWIFTC = xcrun swiftc -sdk $(SDKROOT) -target $(shell uname -m)-apple-macosx14.0 -swift-version 5 -module-cache-path build/module-cache
+
+app: $(APP)/Contents/MacOS/ISS
+
+build/make-icon: app/MakeIcon.swift
+	mkdir -p build
+	$(SWIFTC) -O -o $@ $< -framework AppKit
+
+build/AppIcon.icns: build/make-icon
+	build/make-icon build/AppIcon.iconset
+	iconutil -c icns build/AppIcon.iconset -o $@
+
+$(APP)/Contents/MacOS/ISS: app/App.swift app/SettingsView.swift app/SettingsModel.swift app/Info.plist build/AppIcon.icns $(BIN) Makefile
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
+	$(SWIFTC) -O -parse-as-library -o $@ app/App.swift app/SettingsView.swift app/SettingsModel.swift -framework AppKit -framework SwiftUI -framework ServiceManagement -framework ApplicationServices
+	cp app/Info.plist $(APP)/Contents/Info.plist
+	cp build/AppIcon.icns $(APP)/Contents/Resources/AppIcon.icns
+	cp $(BIN) $(APP)/Contents/MacOS/iss-engine
+	./$(BIN) --settings-schema > $(APP)/Contents/Resources/settings-schema.json
+	codesign --force --sign - --identifier com.instant-swipe.engine $(APP)/Contents/MacOS/iss-engine
+	codesign --force --sign - --identifier com.instant-swipe.app $(APP)
+
+install-app: app
+	mkdir -p "$(APP_INSTALL_DIR)"
+	ditto "$(APP)" "$(APP_INSTALL_DIR)/ISS.app"
+	open "$(APP_INSTALL_DIR)/ISS.app"
+
+.PHONY: app install-app
+
+build/settings-model-test: tests/settings_model_test.swift app/SettingsModel.swift
+	mkdir -p build
+	$(SWIFTC) -Onone -parse-as-library -o $@ tests/settings_model_test.swift app/SettingsModel.swift -framework AppKit -framework SwiftUI -framework ServiceManagement -framework ApplicationServices
+
+test-app: app build/settings-model-test
+	build/settings-model-test $(APP)/Contents/Resources/settings-schema.json
+	codesign --verify --deep --strict $(APP)
+	plutil -lint $(APP)/Contents/Info.plist
+
+.PHONY: test-app

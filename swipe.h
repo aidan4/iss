@@ -4,14 +4,15 @@
 #include <stdbool.h>
 #include <math.h>
 
-#define ISS_SPACE_DISTANCE 0.16
-#define ISS_REVERSE_DISTANCE 0.04
-#define ISS_INITIAL_TRIGGER_DISTANCE 0.0625
-#define ISS_INITIAL_TRIGGER_SECONDS 0.04
-#define ISS_CENTER_SECONDS 0.15
-#define ISS_LONG_SWIPE_SECONDS 0.18
-#define ISS_FLICK_VELOCITY 0.08
-#define ISS_EDGE_REVERSAL_DISTANCE 0.04
+#include "settings.h"
+#define ISS_SPACE_DISTANCE iss_settings.spaceDistance
+#define ISS_REVERSE_DISTANCE iss_settings.reverseDistance
+#define ISS_INITIAL_TRIGGER_DISTANCE iss_settings.initialDistance
+#define ISS_INITIAL_TRIGGER_SECONDS iss_settings.initialSeconds
+#define ISS_CENTER_SECONDS iss_settings.centerSeconds
+#define ISS_LONG_SWIPE_SECONDS iss_settings.longSeconds
+#define ISS_FLICK_VELOCITY iss_settings.flickVelocity
+#define ISS_EDGE_REVERSAL_DISTANCE iss_settings.edgeReverseDistance
 #define ISS_FINISH_VELOCITY 999999.0
 #define ISS_CONFIRM_SECONDS 0.6
 

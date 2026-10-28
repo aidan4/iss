@@ -1,0 +1,268 @@
+import AppKit
+import SwiftUI
+import ApplicationServices
+import ServiceManagement
+
+struct SettingSpec: Decodable {
+    let defaultValue: Double
+    let minimum: Double
+    let maximum: Double
+}
+
+enum SettingsPage: String, CaseIterable, Identifiable {
+    case swiping = "Swiping", longDrag = "Long drags", general = "General"
+    var id: String { rawValue }
+    var symbol: String {
+        switch self {
+        case .swiping: return "rectangle.on.rectangle"
+        case .longDrag: return "hand.draw"
+        case .general: return "gearshape"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .swiping: return "A little motion. A much quicker landing."
+        case .longDrag: return "Find the rhythm for moving through your spaces."
+        case .general: return "Keep ISS close, and ready when you are."
+        }
+    }
+}
+
+// System dependencies are kept together so lifecycle tests can use a harmless
+// child process and isolated preferences, without installing an event tap.
+@MainActor
+struct EngineEnvironment {
+    var executable: URL? = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("iss-engine")
+    var legacyAgent = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/com.instant-swipe.plist")
+    var trusted: () -> Bool = { AXIsProcessTrusted() }
+    var preferences: UserDefaults = .standard
+}
+
+@MainActor
+final class SettingsModel: ObservableObject {
+    let schema: [String: SettingSpec]
+    let configURL: URL
+    let preview: Bool
+    @Published private(set) var values: [String: Double]
+    @Published private(set) var enabled: Bool
+    @Published private(set) var status = "Starting…"
+    @Published private(set) var isRunning = false
+    @Published private(set) var accessibility = false
+    @Published private(set) var loginEnabled = false
+    @Published private(set) var loginNeedsApproval = false
+    @Published var error: String?
+    @Published var page: SettingsPage = .swiping
+    @Published private(set) var log = ""
+    var onStatusChange: (() -> Void)?
+    private let environment: EngineEnvironment
+    private var process: Process?
+    private var pipe: Pipe?
+    private var poller: Timer?
+    private var saveTask: Task<Void, Never>?
+    private var quitting = false
+    private var stopping = false
+    private var outputBuffer = ""
+    private var runID = UUID()
+
+    init(preview: Bool = false, configURL: URL? = nil, schemaURL: URL? = nil, environment: EngineEnvironment? = nil) throws {
+        let environment = environment ?? EngineEnvironment()
+        self.environment = environment
+        accessibility = environment.trusted()
+        self.preview = preview
+        guard let schemaURL = schemaURL ?? Bundle.main.url(forResource: "settings-schema", withExtension: "json") else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        schema = try JSONDecoder().decode([String: SettingSpec].self, from: Data(contentsOf: schemaURL))
+        self.configURL = configURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ISS/settings.plist")
+        var loaded = schema.mapValues(\.defaultValue)
+        if !preview && FileManager.default.fileExists(atPath: self.configURL.path) {
+            let plist = try PropertyListSerialization.propertyList(from: Data(contentsOf: self.configURL), format: nil)
+            guard let dictionary = plist as? [String: Any] else { throw CocoaError(.propertyListReadCorrupt) }
+            for (key, spec) in schema {
+                if let number = dictionary[key] as? NSNumber,
+                   CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite {
+                    loaded[key] = min(spec.maximum, max(spec.minimum, number.doubleValue))
+                }
+            }
+        }
+        values = loaded
+        enabled = preview || (environment.preferences.object(forKey: "switcherEnabled") as? Bool ?? true)
+        if preview { status = "Preview"; accessibility = true }
+    }
+
+    func begin() {
+        guard !preview else { return }
+        refreshSystemStatus()
+        if enabled { start() } else { setStatus("Paused") }
+        poller = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshSystemStatus() }
+        }
+    }
+    func binding(_ key: String) -> Binding<Double> {
+        Binding(get: { self.values[key] ?? self.schema[key]!.defaultValue }, set: { self.set(key, $0) })
+    }
+    func set(_ key: String, _ value: Double) {
+        guard let spec = schema[key], value.isFinite else { return }
+        values[key] = min(spec.maximum, max(spec.minimum, value))
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard !Task.isCancelled else { return }
+            self?.saveReportingError()
+        }
+    }
+    func restoreDefaults() {
+        saveTask?.cancel()
+        values = schema.mapValues(\.defaultValue)
+        saveReportingError()
+    }
+    private func save() throws {
+        guard !preview else { return }
+        let data = try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0)
+        try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: configURL, options: .atomic)
+    }
+    private func saveReportingError() {
+        do { try save() }
+        catch { self.error = "Couldn’t save settings: \(error.localizedDescription)" }
+    }
+    private func setStatus(_ text: String, running: Bool = false) {
+        status = text; isRunning = running; onStatusChange?()
+    }
+    func setEnabled(_ value: Bool) {
+        enabled = value
+        if !preview { environment.preferences.set(value, forKey: "switcherEnabled") }
+        error = nil
+        if value { start() } else { stop() }
+    }
+    func start() {
+        guard !preview, !quitting, process == nil else { return }
+        if FileManager.default.fileExists(atPath: environment.legacyAgent.path) {
+            setStatus("Background service installed")
+            error = "Remove the old background service before using the app: run make uninstall in the ISS project folder, then click Retry. Your swipe settings will be kept."
+            return
+        }
+        guard accessibility else { setStatus("Accessibility needed"); return }
+        do {
+            try save()
+            guard let executable = environment.executable,
+                  FileManager.default.isExecutableFile(atPath: executable.path) else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            let child = Process()
+            let output = Pipe()
+            child.executableURL = executable
+            child.arguments = ["--config", configURL.path, "--managed"]
+            child.standardError = output
+            child.standardOutput = FileHandle.nullDevice
+            child.standardInput = FileHandle.nullDevice
+            log = ""; outputBuffer = ""
+            let id = UUID(); runID = id
+            output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { handle.readabilityHandler = nil; return }
+                let text = String(decoding: data, as: UTF8.self)
+                Task { @MainActor in self?.received(text, id: id) }
+            }
+            child.terminationHandler = { [weak self] child in
+                let code = child.terminationStatus
+                Task { @MainActor in self?.exited(code, id: id) }
+            }
+            process = child; pipe = output
+            setStatus("Starting…")
+            do { try child.run() }
+            catch {
+                output.fileHandleForReading.readabilityHandler = nil
+                process = nil; pipe = nil
+                throw error
+            }
+        } catch {
+            self.error = "Couldn’t start ISS: \(error.localizedDescription)"
+            setStatus("Unable to start")
+        }
+    }
+    private func received(_ text: String, id: UUID) {
+        guard id == runID else { return }
+        log = String((log + text).suffix(16000))
+        guard !stopping, !quitting, process?.isRunning == true else { return }
+        outputBuffer += text
+        while let end = outputBuffer.firstIndex(of: "\n") {
+            let line = String(outputBuffer[..<end])
+            outputBuffer.removeSubrange(...end)
+            if line.contains("swipe active") || line.contains("Accessibility restored") {
+                setStatus("Active", running: true)
+            } else if line.contains("Accessibility removed") { setStatus("Accessibility needed") }
+        }
+        outputBuffer = String(outputBuffer.suffix(16000))
+    }
+    private func exited(_ code: Int32, id: UUID) {
+        guard id == runID else { return }
+        pipe?.fileHandleForReading.readabilityHandler = nil
+        pipe = nil; process = nil
+        guard !quitting else { return }
+        if stopping {
+            stopping = false
+            setStatus("Paused")
+            if enabled { start() }
+        } else if code == 73 {
+            setStatus("Another ISS is running")
+            error = "Stop the Terminal copy of ISS first. If you installed the old background service with make install, run make uninstall in the project folder, then click Retry."
+        } else {
+            setStatus(accessibility ? "Stopped unexpectedly" : "Accessibility needed")
+            error = code == 1
+                ? "Allow ISS in System Settings → Privacy & Security → Accessibility, then click Retry. If iss-engine is listed separately, allow it too."
+                : "The switcher stopped (code \(code)). Click Retry to start it again."
+        }
+    }
+    private func stop() {
+        guard let child = process else { setStatus("Paused"); return }
+        stopping = true
+        setStatus("Pausing…")
+        if child.isRunning { child.terminate() }
+    }
+    func retry() {
+        error = nil
+        accessibility = environment.trusted()
+        if process != nil { stop() } else if enabled { start() }
+    }
+    func requestAccessibility() {
+        guard !preview else { return }
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+    private func refreshSystemStatus() {
+        let previouslyTrusted = accessibility
+        accessibility = environment.trusted()
+        let state = SMAppService.mainApp.status
+        loginEnabled = state == .enabled || state == .requiresApproval
+        loginNeedsApproval = state == .requiresApproval
+        if !accessibility && enabled { setStatus("Accessibility needed") }
+        if accessibility && !previouslyTrusted && enabled {
+            if process == nil { error = nil; start() } else { setStatus("Active", running: true) }
+        }
+    }
+    func setLogin(_ value: Bool) {
+        guard !preview else { return }
+        do {
+            if value { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+        } catch { self.error = "Couldn’t change launch at login: \(error.localizedDescription)" }
+        refreshSystemStatus()
+    }
+    func openLoginSettings() { SMAppService.openSystemSettingsLoginItems() }
+    func revealConfig() { NSWorkspace.shared.activateFileViewerSelecting([configURL]) }
+    func copyDiagnostics() {
+        let report = "ISS 1.0\nmacOS \(ProcessInfo.processInfo.operatingSystemVersionString)\nStatus: \(status)\nAccessibility: \(accessibility)\nSettings: \(values)\n\n\(log)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+    }
+    func shutdown() {
+        quitting = true; saveTask?.cancel(); poller?.invalidate()
+        saveReportingError()
+        if let process, process.isRunning { process.terminate() }
+        // The engine finishes its current slide and removes its tap on SIGTERM.
+        // --managed also exits if this app dies without reaching shutdown.
+    }
+}
