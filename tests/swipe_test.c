@@ -33,9 +33,21 @@ int main(void) {
         near(e.progress,direction*.15); near(e.velocity,direction*ISS_FINISH_VELOCITY);
         assert(s.target==2+direction && s.index==2);
     }
-    // Quick, far flick still lands once.
+    // First trigger: both the shorter time and distance gates must pass.
+    for(int direction=-1; direction<=1; direction+=2) {
+        start(&s,1,3);
+        e=move(&s,direction*.02,.01,1); assert(e.phase==SwipeChange);
+        e=move(&s,direction*.07,.039,1); assert(e.phase==SwipeChange);
+        e=move(&s,direction*.07,.04,1); assert(e.phase==SwipeEnd);
+        assert(s.target==1+direction);
+        near(s.pending,direction*(.07-ISS_INITIAL_TRIGGER_DISTANCE));
+        start(&s,1,3);
+        move(&s,direction*.02,.01,1);
+        e=move(&s,direction*.03,.3,1); assert(e.phase==SwipeChange);
+    }
+    // Quick, far flick starts earlier but still requests only one landing.
     start(&s,0,4); move(&s,.1,.02,0); e=move(&s,2,.1,0);
-    assert(e.phase==SwipeChange);
+    assert(e.phase==SwipeEnd);
     e=swipe_finish(&s,frame(SwipeEnd,2,3),.12);
     assert(s.target==1);
     // Long drag: preview first, then centered steps with travel AND dwell.

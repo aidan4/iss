@@ -5,7 +5,7 @@ Keeps the native finger-following preview when swiping between macOS spaces, acc
 ## Swipe behavior
 
 - The first landing completes the full remaining slide over 60 ms, then commits immediately to avoid a long ease-out and delayed focus.
-- A sustained drag (at least 180 ms) previews the first adjacent space, then lands after 0.125 units of travel. Further travel advances in centered steps: each step consumes another 0.125 units, waits for the Dock to confirm the landing, and keeps the space centered for at least 120 ms before advancing again. Subsequent steps do not reopen a partial preview.
+- The first animation starts during the swipe after at least 40 ms and 0.0625 units of travel, or on release for an earlier flick. Further travel advances in centered steps: each step consumes another 0.125 units, waits for the Dock to confirm the landing, and keeps the space centered for at least 120 ms before advancing again. Subsequent steps do not reopen a partial preview.
 - Small peeks and reversals settle using the Dock's native behavior.
 - Outward gestures at the first or last space are suppressed from Begin through End. A deliberate inward reversal can start a new segment; release jitter cannot fling back to the previous space.
 - Vertical swipes, including Mission Control and App Exposé, pass through.
@@ -16,7 +16,7 @@ The gesture thresholds live in `swipe.h`; the initial slide duration lives in `s
 
 The session-level event tap preserves the native preview. When the first transition commits, a run-loop timer drives Changed frames linearly over 60 ms, completing the remaining travel to the adjacent space. A full space is `N/(N-1)` progress units for a display with `N` spaces. At the final frame, End preserves the full destination progress with a minimal nonzero velocity, following FasterSwiper’s segmented commit path. It does not reset the completed slide back to near-zero progress. Timer frames are tagged to bypass our event tap, and hardware movement during the animation is retained for subsequent steps.
 
-This follows the timed-position animation and immediate commit approach in [FasterSwiper](https://github.com/mgbowen/FasterSwiper), replacing the earlier velocity-only first landing. The frame timing and position conversion are implemented independently in C. The prior 100 ms setting was observed at approximately 101–104 ms in live tests, with prompt focus recovery; the default was then shortened to 60 ms. Actual frame delivery still depends on scheduling and display refresh.
+This follows the timed-position animation and immediate commit approach in [FasterSwiper](https://github.com/mgbowen/FasterSwiper), replacing the earlier velocity-only first landing. The frame timing and position conversion are implemented independently in C. The prior 100 ms setting was observed at approximately 101–104 ms in live tests, with prompt focus recovery; the default is now 60 ms. Actual frame delivery still depends on scheduling and display refresh.
 
 On macOS 27, phase, progress, timestamp and velocity are synchronized in both the outer CGEvent and embedded native IOHID queue. Posted frames use the Natural Scrolling direction convention. The signed 16.16 velocity saturates at 32767 rather than overflowing. Subsequent centered steps retain the existing high-velocity finish.
 

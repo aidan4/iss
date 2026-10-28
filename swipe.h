@@ -5,6 +5,8 @@
 #include <math.h>
 
 #define ISS_SPACE_DISTANCE 0.125
+#define ISS_INITIAL_TRIGGER_DISTANCE 0.0625
+#define ISS_INITIAL_TRIGGER_SECONDS 0.04
 #define ISS_CENTER_SECONDS 0.12
 #define ISS_LONG_SWIPE_SECONDS 0.18
 #define ISS_FLICK_VELOCITY 0.08
@@ -167,11 +169,15 @@ static inline SwipeEvent swipe_move(Swipe *s, SwipeEvent e, double now,
     e.progress = preview;
     // Emit at most one phase per hardware sample. Never send End/Begin/End
     // back-to-back, or predict several switches the Dock hasn't processed yet.
-    if (s->changed && now - s->started >= ISS_LONG_SWIPE_SECONDS &&
-        fabs(s->position) >= ISS_SPACE_DISTANCE) {
+    // Start the first slide sooner; continued paging retains its own travel
+    // threshold and timing so this does not increase multi-space sensitivity.
+    double trigger_distance = s->paging ? ISS_SPACE_DISTANCE : ISS_INITIAL_TRIGGER_DISTANCE;
+    double trigger_seconds = s->paging ? ISS_LONG_SWIPE_SECONDS : ISS_INITIAL_TRIGGER_SECONDS;
+    if (s->changed && now - s->started >= trigger_seconds &&
+        fabs(s->position) >= trigger_distance) {
         double direction = copysign(1, s->position);
         s->target = s->index + (int)direction;
-        s->pending = s->position - direction * ISS_SPACE_DISTANCE;
+        s->pending = s->position - direction * trigger_distance;
         s->mode = SwipeWaiting;
         s->waiting_since = now;
         s->open = false;
