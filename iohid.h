@@ -69,6 +69,8 @@ static inline CGEventRef sync_native_payload(CGEventRef ev, double input_progres
     }
     uint8_t *out = CFDataGetMutableBytePtr(edited), *q = out+payload;
     out[payload-4]=(uint8_t)(size>>8); out[payload-3]=(uint8_t)size;
+    uint64_t timestamp = CGEventGetTimestamp(ev);
+    memcpy(q, &timestamp, sizeof(timestamp));
     if (append) hid_put32(q+24,count+1);
     uint32_t options=hid_u32(q+fluid+8);
     options=(options & 0x00ffffff) | ((uint32_t)CGEventGetIntegerValueField(ev,(CGEventField)132)<<24);

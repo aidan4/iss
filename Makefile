@@ -16,10 +16,10 @@ endif
 LDFLAGS  = -framework ApplicationServices -framework CoreFoundation \
            -Wl,-dead_strip -Wl,-dead_strip_dylibs -Wl,-x
 
-$(BIN): iss.c swipe.h native_event.h iohid.h Makefile
+$(BIN): iss.c swipe.h native_event.h iohid.h slide.h Makefile
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-test: tests/swipe_test.c tests/native_event_test.c swipe.h native_event.h iohid.h
+test: tests/swipe_test.c tests/native_event_test.c swipe.h native_event.h iohid.h slide.h
 	$(CC) $(CFLAGS) -o /tmp/iss-swipe-test tests/swipe_test.c
 	/tmp/iss-swipe-test
 	$(CC) $(CFLAGS) -o /tmp/iss-native-event-test tests/native_event_test.c $(LDFLAGS)

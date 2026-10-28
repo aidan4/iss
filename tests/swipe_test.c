@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "../swipe.h"
+#include "../slide.h"
 static SwipeEvent frame(enum SwipePhase phase, double p, double v) {
     return (SwipeEvent){.phase=phase,.progress=p,.velocity=v};
 }
@@ -10,9 +11,20 @@ static void start(Swipe *s,int index,int count) {
 static SwipeEvent move(Swipe *s,double p,double t,int observed) {
     return swipe_move(s,frame(SwipeChange,p,0),t,observed,true);
 }
-static void near(double a,double b) { assert(fabs(a-b)<1e-8); }
+static void near(double a,double b) { if(fabs(a-b)>=1e-8) fprintf(stderr,"near failed actual=%g expected=%g\n",a,b); assert(fabs(a-b)<1e-8); }
 int main(void) {
     Swipe s; SwipeEvent e;
+    // A full visual space depends on the size of the space list. Timed
+    // frames reach that exact endpoint at the configured deadline, independent of event rate.
+    near(slide_target(1,1),0);
+    near(slide_target(2,1),2);
+    near(slide_target(3,1),1.5);
+    near(slide_target(4,-1),-4.0/3);
+    near(slide_position(.2,1.5,0),.2);
+    near(slide_position(.2,1.5,ISS_INITIAL_SLIDE_SECONDS / 2),.85);
+    near(slide_position(.2,1.5,ISS_INITIAL_SLIDE_SECONDS),1.5);
+    near(slide_position(.2,1.5,.2),1.5);
+    near(slide_position(-.2,-1.5,ISS_INITIAL_SLIDE_SECONDS / 2),-.85);
     for(int direction=-1;direction<=1;direction+=2) {
         start(&s,2,5);
         e=move(&s,direction*.15,.05,2);
@@ -29,12 +41,14 @@ int main(void) {
     // Long drag: preview first, then centered steps with travel AND dwell.
     start(&s,0,4); move(&s,.1,.05,0);
     e=move(&s,.3,.2,0); assert(e.phase==SwipeEnd && s.target==1);
+    near(e.velocity,ISS_FINISH_VELOCITY); near(e.progress,.3);
     e=move(&s,.5,.22,0); assert(e.drop && s.index==0);
     e=move(&s,.55,.24,1); assert(e.drop && s.index==1);
     e=move(&s,.6,.3,1); assert(e.drop); // Centered; no premature next preview.
     e=move(&s,.65,.37,1); assert(e.phase==SwipeBegin); near(e.progress,0);
     e=move(&s,.67,.38,1); assert(e.phase==SwipeChange); near(e.progress,.0001);
     e=move(&s,.7,.39,1); assert(e.phase==SwipeEnd && s.target==2);
+    near(e.velocity,ISS_FINISH_VELOCITY);
     near(e.progress,.0001);
     e=move(&s,.75,.42,2); assert(e.drop && s.index==2);
     e=move(&s,.76,.55,2); assert(e.phase==SwipeBegin);
@@ -56,17 +70,19 @@ int main(void) {
     start(&s,0,3); move(&s,.1,.05,0); move(&s,.3,.2,0);
     e=move(&s,2,.4,0); assert(e.drop && s.index==0);
     e=move(&s,3,.9,0); assert(e.drop && s.mode==SwipeFailed);
-    e=swipe_finish(&s,frame(SwipeEnd,3,5),1); near(e.velocity,0);
+    e=swipe_finish(&s,frame(SwipeEnd,3,5),1); assert(e.drop);
     // Both boundaries, reversal and unknown topology.
     for(int direction=-1;direction<=1;direction+=2) {
         int index=direction<0?0:2;
         start(&s,index,3); e=move(&s,direction*.5,.2,index); near(e.progress,0);
-        e=move(&s,direction*.35,.3,index); near(e.progress,-direction*.15);
+        e=move(&s,direction*.35,.3,index); assert(e.phase==SwipeBegin); near(e.progress,0);
+        e=move(&s,direction*.34,.31,index); near(e.progress,-direction*.16);
     }
     start(&s,0,1); e=move(&s,2,.3,0); near(e.progress,0);
-    e=swipe_finish(&s,frame(SwipeEnd,2,5),.4); near(e.velocity,0);
-    start(&s,-1,0); e=move(&s,.5,.3,-1); near(e.progress,.5);
-    e=swipe_finish(&s,frame(SwipeEnd,.5,2),.4); near(e.velocity,2);
+    e=swipe_finish(&s,frame(SwipeEnd,2,5),.4); assert(e.drop);
+    start(&s,-1,0); e=move(&s,.5,.3,-1); assert(e.drop);
+    e=swipe_finish(&s,frame(SwipeEnd,.5,2),.4);
+    assert(e.drop);
     // Small peeks, cancellations and external space changes stay safe.
     start(&s,1,3); move(&s,.1,.05,1);
     e=swipe_finish(&s,frame(SwipeEnd,.1,.005),.1); near(e.velocity,.005);
@@ -75,5 +91,37 @@ int main(void) {
     start(&s,1,3); move(&s,.1,.05,1);
     e=swipe_move(&s,frame(SwipeChange,.2,0),.1,1,false);
     assert(e.phase==SwipeCancel);
+    // Nonzero Began must not start an edge rubber-band. A reversed release
+    // (including a discrete swipe without Changed) must not fling backwards.
+    for(int direction=-1;direction<=1;direction+=2) {
+        int index=direction<0?0:2;
+        s=(Swipe){0};
+        e=swipe_begin(&s,frame(SwipeBegin,direction*.02,0),index,3,0);
+        assert(e.drop && s.edge_blocked);
+        e=move(&s,direction*.019,.02,index); assert(e.drop);
+        e=swipe_finish(&s,frame(SwipeEnd,direction*.019,-direction*3),.05);
+        assert(e.drop && s.target==-1);
+        s=(Swipe){0};
+        swipe_begin(&s,frame(SwipeBegin,direction*.02,0),index,3,0);
+        e=swipe_finish(&s,frame(SwipeEnd,direction*.02,-direction*4),.02);
+        assert(e.drop);
+        // A deliberate reversal during the drag still works.
+        s=(Swipe){0};
+        swipe_begin(&s,frame(SwipeBegin,direction*.02,0),index,3,0);
+        e=move(&s,-direction*.05,.05,index);
+        assert(!s.edge_blocked && e.phase==SwipeBegin);
+        e=move(&s,-direction*.06,.06,index);
+        assert(e.phase==SwipeChange && e.progress*direction<0);
+    }
+    // Addition/removal (including removing the last target) invalidates the
+    // whole animation, rather than recomputing a different destination.
+    assert(slide_context_valid(1,2,3,1,3));
+    assert(slide_context_valid(1,2,3,2,3));
+    assert(!slide_context_valid(1,2,3,1,4));
+    assert(!slide_context_valid(1,2,3,1,2));
+    assert(!slide_context_valid(1,2,3,0,3));
+    assert(!slide_context_valid(2,3,3,2,3));
+    assert(!slide_context_valid(0,-1,3,0,3));
+    assert(!slide_context_valid(0,1,1,0,1));
     puts("swipe state tests passed");
 }

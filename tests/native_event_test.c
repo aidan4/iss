@@ -3,6 +3,7 @@
 #include <string.h>
 #include "../native_event.h"
 #include "../iohid.h"
+#include "../slide.h"
 
 static CGEventRef fixture(enum SwipePhase phase, double progress, double velocity) {
     CGEventRef e = CGEventCreate(NULL);
@@ -86,6 +87,7 @@ int main(void) {
         CGEventRef e = fixture(input.phase, input.progress, input.velocity);
         CGEventRef expected = CGEventCreateCopy(e);
         if (direction < 0) {
+            CGEventSetIntegerValueField(expected, kPhase, SwipeCancel);
             CGEventSetDoubleValueField(expected, kProgress, 0);
             CGEventSetDoubleValueField(expected, kVelocityX, 0);
         }
@@ -153,6 +155,28 @@ int main(void) {
         }
         CFRelease(cleared_data); CFRelease(cleared); CFRelease(bytes);
         CFRelease(synced); CFRelease(source);
+    }
+    // Full-boundary commits must survive 16.16 serialization after the space
+    // count changes; the minimal terminal velocity must not flush to zero.
+    for (int count=2; count<=8; count++) for (int direction=-1; direction<=1; direction+=2) {
+        double target=slide_target(count,direction);
+        CGEventRef source=fixture(SwipeEnd,target,direction/65536.0);
+        double sign=1;
+        CGEventRef ended=sync_native_payload(source,target,direction/65536.0,&sign);
+        assert(ended);
+        CFDataRef data=CGEventCreateData(NULL,ended);
+        const uint8_t *b=CFDataGetBytePtr(data);
+        bool found=false;
+        for(CFIndex i=4;i+100<=CFDataGetLength(data);i++) {
+            if(b[i]==0 && b[i+1]==96 && b[i+2]==0x10 && b[i+3]==0x6d) {
+                int32_t p,v;
+                memcpy(&p,b+i+4+28+36,4); memcpy(&v,b+i+4+68+16,4);
+                assert(p==hid_fixed(target) && v==direction);
+                found=true;
+            }
+        }
+        assert(found);
+        CFRelease(data); CFRelease(ended); CFRelease(source);
     }
     puts("native event tests passed");
 }
