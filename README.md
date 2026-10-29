@@ -11,6 +11,10 @@ Keeps the native finger-following preview when swiping between macOS spaces, acc
 - Outward gestures at the first or last space are suppressed from Begin through End. A deliberate inward reversal can start a new segment; release jitter cannot fling back to the previous space.
 - Vertical swipes, including Mission Control and App Exposé, pass through.
 
+**Swiping → On release** offers an alternative: the preview follows your fingers, multiplied by the **Gesture speed multiplier**, and the timed slide begins only when you lift. Momentum chooses the next center in its direction, so a short forward flick still advances. Reversing selects the next center in the reverse direction; a stationary release selects the nearest center. Continued travel previews more Spaces fluidly, without automatic long-drag steps or centered pauses. Landing uses the scaled visible position for both native End and Cancel events; macOS’s original release decision is based on unscaled travel. Edges remain clamped.
+
+**Acceleration multiplier** adds a speed-dependent boost on top of the gesture speed multiplier in On release mode. It defaults to **0 (off)**. Higher values make fast finger movement cover more Spaces while slow movement stays close to the base speed. The boost smoothly approaches `1 + acceleration` times the base multiplier (for example, acceleration 1 approaches twice the base speed). Speed is measured from raw finger travel over time and smoothed over 35 ms; changing speed affects only new movement, so it cannot reposition an existing preview. Stopping adds no travel, and reversing clears the previous direction’s boost. Landing selection and edge clamping use the resulting preview position.
+
 These are the default settings. The native app lets you change them without rebuilding. Distances use native gesture progress units, not pixels.
 
 ## How it works
@@ -21,7 +25,9 @@ This follows the timed-position animation and immediate commit approach in [Fast
 
 On macOS 27, phase, progress, timestamp and velocity are synchronized in both the outer CGEvent and embedded native IOHID queue. Posted frames use the Natural Scrolling direction convention. The signed 16.16 velocity saturates at 32767 rather than overflowing. Every step finishes at its full destination progress with minimal terminal velocity.
 
-For a long drag, a Changed sample becomes an early End. Further samples are held until the active-space query reports the expected destination. After confirmation and the centered dwell, continued travel starts the next step. Subsequent steps begin centered and use the same timed full-slide animation before settling on the next space. There are no bursts of synthetic Begin/Changed/End sequences and no speculative index increments. If confirmation fails within 600 ms, continuation stops until the next physical gesture. The real terminal event still passes through with zero progress/velocity after an early finish, closing the hardware gesture on macOS 27.
+In release mode, the reducer tracks continuous finger travel while the event adapter uses adjacent native segments. Crossing a Space’s exact center closes that segment at full progress with minimal velocity and starts the next preview immediately, without a timed slide or centered pause. Only the first and last Spaces clamp movement. On release, the global destination is converted to the current segment’s coordinates, so the timer finishes only the remaining partial Space. Preview and timed frames use the same synthetic event path; no physical End is relabelled Changed at the handoff and there are no catch-up switches after the landing.
+
+In the default mode, for a long drag, a Changed sample becomes an early End. Further samples are held until the active-space query reports the expected destination. After confirmation and the centered dwell, continued travel starts the next step. Subsequent steps begin centered and use the same timed full-slide animation before settling on the next space. There are no bursts of synthetic Begin/Changed/End sequences and no speculative index increments. If confirmation fails within 600 ms, continuation stops until the next physical gesture. The real terminal event still passes through with zero progress/velocity after an early finish, closing the hardware gesture on macOS 27.
 
 Boundary checks use the ordered spaces of the display under the pointer, including fullscreen spaces. The active index comes from the per-display managed-space API (with `CGSGetActiveSpace` as a single-display fallback), rather than the stale `Current Space` dictionary. The ordered space IDs and count are rechecked while dragging, before release, and on every timed animation frame. Adding, removing, or reordering a space cancels an in-flight animation and clears its pending target. The next gesture reads the new layout and recomputes the slide distance. If the initial private space query is unavailable, that gesture is suppressed until the next gesture can obtain valid bounds.
 
@@ -37,7 +43,7 @@ make test
 make test-app
 ```
 
-Tests cover both native directions, preview and release progress, first/last-space clamping, reversal, confirmed multi-space drags, delayed or failed landings, rapid subsequent gestures, cancellation, and single-space displays. Settings tests cover clamping and invalid files, altered gesture thresholds, persistence, reset, and app pause/resume/quit using a harmless dummy helper. The CGEvent tests check serialized native events, embedded phase/velocity updates, insertion of missing velocity children, opposite payload signs, and overflow prevention without posting gestures to the desktop.
+Tests cover both native directions, preview and release progress, first/last-space clamping, reversal, confirmed multi-space drags, delayed or failed landings, rapid subsequent gestures, cancellation, and single-space displays. Settings tests cover decimal precision, numeric domains and invalid files, altered gesture thresholds, persistence, reset, and app pause/resume/quit using a harmless dummy helper. The CGEvent tests check serialized native events, embedded phase/velocity updates, insertion of missing velocity children, opposite payload signs, and overflow prevention without posting gestures to the desktop.
 
 ## Native settings app and menu bar
 
@@ -48,9 +54,11 @@ open build/ISS.app
 
 The settings window has three pages:
 
-- **Swiping:** slide duration, activation distance and delay, and flick sensitivity. Try Slide previews the timing without changing your desktop.
+- **Swiping:** swipe mode, slide duration, activation distance and delay, flick sensitivity, and the release-mode gesture speed and acceleration multipliers. Try Slide previews the timing without changing your desktop.
 - **Long drags:** distance per space, centered pause, long-drag delay, reversal distance, and inward reversal distance at an edge.
 - **General:** instant focus across Spaces, launch at login, Accessibility permission, switcher status, restart, and local diagnostics.
+
+Sliders produce whole milliseconds, two decimal places for the gesture multiplier, and up to four decimal places for gesture distances. Every numeric field also accepts typed decimals; press Return or leave the field to save. Slider ranges are suggestions, and typed values can exceed them. Durations, distances, and the multiplier must be positive; delays and the flick threshold can also be zero. Invalid entries leave the saved value unchanged.
 
 Changes save automatically and apply between physical gestures, after any current slide finishes. Every setting has a reset button; Restore Defaults returns to the tuning above. Closing the window leaves ISS in the menu bar. The menu offers pause/resume, settings, launch at login, Accessibility settings, and quit. Pausing or quitting returns gestures to macOS.
 
@@ -66,7 +74,7 @@ Stop any foreground `./iss` process with Ctrl+C before opening the app. The new 
 
 Enable **Launch at login** in the app once it is in its permanent location. ISS uses macOS’s built-in login-item registration. If approval is required, the app provides a link to Login Items. Turn this setting off before moving or removing the app.
 
-Settings are saved in `~/Library/Application Support/ISS/settings.plist`. The app and engine share their default values and supported ranges through `settings.h`; the app’s schema is generated during the build. The helper validates the file and defers reloads throughout a gesture and its animation. It exits if the app quits or crashes. The app stays offline and does not send diagnostics automatically.
+Settings are saved in `~/Library/Application Support/ISS/settings.plist`. The app and engine share their default values, slider ranges, and numeric domains through `settings.h`; the app’s schema is generated during the build. The helper validates the file and defers reloads throughout a gesture and its animation. It exits if the app quits or crashes. The app stays offline and does not send diagnostics automatically.
 
 Normal background operation has no repeating status or settings-file poll. The engine waits on kernel notifications for file edits, app exit, and termination signals. The UI refreshes system status when opened/activated and publishes only actual changes. A two-second permission retry runs only while Accessibility is missing. Timers run only during a swipe, a short pending focus request, or cursor restoration after a cross-display jump.
 

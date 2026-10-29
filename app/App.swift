@@ -113,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func renderPages(_ directory: String, pages: [SettingsPage]) {
         guard let page = pages.first else { NSApp.terminate(nil); return }
         model.page = page
+        if CommandLine.arguments.contains("--release-preview") { model.set("releaseOnly", 1) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [self] in
             guard let view = window.contentView,
                   let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {

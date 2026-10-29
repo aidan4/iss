@@ -5,6 +5,7 @@
 #include <math.h>
 
 #include "settings.h"
+#include "slide.h"
 #define ISS_SPACE_DISTANCE iss_settings.spaceDistance
 #define ISS_REVERSE_DISTANCE iss_settings.reverseDistance
 #define ISS_INITIAL_TRIGGER_DISTANCE iss_settings.initialDistance
@@ -26,8 +27,10 @@ typedef struct {
 typedef struct {
     int index, count, target, last_direction, pending_direction;
     enum SwipeMode mode;
-    double started, waiting_since, last, position, pending, centered_since, edge_travel, reverse_travel;
-    bool active, open, changed, rebased, passthrough, paging, edge_blocked, fast_reverse;
+    double started, waiting_since, last, position, pending, centered_since, edge_travel, reverse_travel, preview_gain, motion_delta, motion_time;
+    double acceleration, sample_time, speed;
+    int speed_direction;
+    bool active, open, changed, rebased, passthrough, paging, edge_blocked, fast_reverse, release_only;
 } Swipe;
 
 // Native events already include the scroll preference. On 26 AND 27 positive
@@ -51,6 +54,45 @@ static inline SwipeEvent swipe_drop(SwipeEvent e) {
 static inline SwipeEvent swipe_zero(SwipeEvent e) {
     e.progress = e.velocity = 0;
     return e;
+}
+
+// One continuous coordinate, relative to the physical gesture's origin.
+// Clamp only at the display's ends, discarding overshoot for immediate reversal.
+static inline double swipe_release_preview(const Swipe *s, double position) {
+    double span = slide_target(s->count, 1);
+    return fmax(-s->index * span, fmin((s->count - 1 - s->index) * span, position));
+}
+
+// Measure raw finger speed, independently of the base multiplier. Native
+// Changed events usually carry zero velocity, so derive it from travel/time.
+// A time-based filter smooths uneven event delivery without adding an idle timer.
+static inline double swipe_scaled_delta(Swipe *s, double delta, double now) {
+    double elapsed = now - s->sample_time;
+    if (elapsed > 0) s->sample_time = now;
+    if (s->acceleration == 0 || elapsed <= 0 || !isfinite(elapsed))
+        return delta * s->preview_gain;
+    int direction = (delta > 0) - (delta < 0);
+    if (direction && direction != s->speed_direction) {
+        s->speed = 0; // Don't carry a fast forward boost into a gentle reversal.
+        s->speed_direction = direction;
+    }
+    double instant = fmin(1e6, fabs(delta) / fmax(elapsed, .001));
+    double alpha = -expm1(-elapsed / .035);
+    s->speed += alpha * (instant - s->speed);
+    if (delta == 0) return 0; // A stopped finger never moves the preview.
+    // Smoothly approach 1 + acceleration times the base speed. Slow travel
+    // stays close to the base; the bounded curve avoids runaway gain spikes.
+    double boost = 1 + s->acceleration * (s->speed / (s->speed + 2));
+    return delta * s->preview_gain * boost;
+}
+
+static inline int swipe_release_target(const Swipe *s, double momentum) {
+    double offset = s->position / slide_target(s->count, 1);
+    // Avoid selecting an extra Space because of floating-point noise at a center.
+    if (fabs(offset - round(offset)) < 1e-7) offset = round(offset);
+    double steps = momentum > 0 ? ceil(offset) : momentum < 0 ? floor(offset) :
+                   copysign(ceil(fabs(offset) - 0.5), offset);
+    return (int)fmax(0, fmin(s->count - 1, s->index + steps));
 }
 
 // Track movement direction independently of accumulated forward distance.
@@ -84,9 +126,12 @@ static inline SwipeEvent swipe_begin(Swipe *s, SwipeEvent e, int index, int coun
     *s = (Swipe){ .index = index, .count = count, .target = -1,
                  .started = now, .last = e.progress, .position = e.progress,
                  .active = true, .open = true,
-                 .passthrough = false };
+                 .passthrough = false,
+                 .release_only = iss_settings.releaseOnly >= 0.5,
+                 .preview_gain = iss_settings.gestureMultiplier,
+                 .acceleration = iss_settings.gestureAcceleration, .sample_time = now };
     // During a topology update, never guess a boundary from an invalid index.
-    if (index < 0 || count < 1 || index >= count) {
+    if (index < 0 || count < 1 || index >= count || (s->release_only && count == 1)) {
         s->mode = SwipeFailed;
         s->open = false;
         return swipe_drop(e);
@@ -108,6 +153,13 @@ static inline SwipeEvent swipe_begin(Swipe *s, SwipeEvent e, int index, int coun
         s->open = false;
         return swipe_drop(e);
     }
+    if (s->release_only) {
+        s->position = swipe_release_preview(s, e.progress * s->preview_gain);
+        s->rebased = true;
+        if (fabs(s->position) > 1e-6) { s->motion_delta = s->position; s->motion_time = now; }
+        e.progress = s->position;
+        e.velocity = 0;
+    }
     return e;
 }
 
@@ -127,6 +179,24 @@ static inline SwipeEvent swipe_move(Swipe *s, SwipeEvent e, double now,
 
     double delta = e.progress - s->last;
     s->last = e.progress;
+    if (s->release_only && s->mode == SwipeWaiting) {
+        // A new physical gesture may arrive before the previous landing is
+        // confirmed. Start a fresh preview only after that confirmation.
+        if (observed_index == s->target) {
+            s->index = observed_index; s->target = -1; s->position = 0;
+            s->mode = SwipeTracking; s->open = true; s->changed = false;
+            s->sample_time = now; s->speed = 0; s->speed_direction = 0;
+            e.phase = SwipeBegin;
+            return swipe_zero(e);
+        }
+        if ((observed_index >= 0 && observed_index != s->index) ||
+            now - s->waiting_since >= ISS_CONFIRM_SECONDS) s->mode = SwipeFailed;
+        return swipe_drop(e);
+    }
+    if (s->release_only) {
+        delta = swipe_scaled_delta(s, delta, now);
+        if (fabs(delta) > 1e-6) { s->motion_delta = delta; s->motion_time = now; }
+    }
     if (s->mode == SwipeWaiting || s->mode == SwipeBetween) {
         swipe_accumulate_pending(s, delta);
         if (s->mode == SwipeWaiting) {
@@ -167,7 +237,7 @@ static inline SwipeEvent swipe_move(Swipe *s, SwipeEvent e, double now,
     if (s->edge_blocked) {
         s->edge_travel += delta;
         if (!swipe_allowed(s, s->edge_travel)) s->edge_travel = 0;
-        if (fabs(s->edge_travel) < ISS_EDGE_REVERSAL_DISTANCE) return swipe_drop(e);
+        if (s->edge_travel == 0 || (!s->release_only && fabs(s->edge_travel) < ISS_EDGE_REVERSAL_DISTANCE)) return swipe_drop(e);
         s->edge_blocked = false;
         s->position = s->edge_travel;
         s->edge_travel = 0;
@@ -175,10 +245,22 @@ static inline SwipeEvent swipe_move(Swipe *s, SwipeEvent e, double now,
             s->open = true;
             s->changed = false;
             e.phase = SwipeBegin;
+            if (s->release_only) {
+                s->position = swipe_release_preview(s, s->position);
+                e.progress = s->position; e.velocity = 0;
+                return e;
+            }
             return swipe_zero(e);
         }
     } else {
         s->position += delta;
+    }
+    if (s->release_only) {
+        s->position = swipe_release_preview(s, s->position);
+        s->changed = true;
+        e.progress = s->position;
+        e.velocity = 0;
+        return e;
     }
     if (s->position != 0 && !swipe_allowed(s, s->position)) {
         s->position = 0;
@@ -227,6 +309,33 @@ static inline SwipeEvent swipe_finish(Swipe *s, SwipeEvent e, double now) {
     bool was_open = s->open;
     s->open = false;
     if (s->passthrough) return e;
+    if (s->release_only) {
+        if (!was_open) return swipe_drop(e);
+        if (s->mode == SwipeFailed) {
+            s->target = -1;
+            e.phase = SwipeCancel;
+            return swipe_zero(e);
+        }
+        // End can reset progress to zero. Keep the last displayed position,
+        // but use release momentum to choose the next center in that direction.
+        // Some devices omit terminal velocity; recent physical movement is the
+        // fallback. A held/stationary release instead chooses the nearest center.
+        double momentum = isfinite(e.velocity) && fabs(e.velocity) > 1e-6 ? e.velocity :
+                          now - s->motion_time <= 0.10 ? s->motion_delta : 0;
+        // Native Cancel also represents a finger lift that macOS judged too
+        // short using unscaled travel. Recompute both terminal phases from our
+        // displayed position; real topology/tap failures are handled above.
+        s->target = swipe_release_target(s, momentum);
+        int direction = (s->target > s->index) - (s->target < s->index);
+        e.phase = SwipeEnd;
+        e.progress = s->position;
+        e.velocity = 0;
+        s->last_direction = s->pending_direction = direction;
+        s->pending = s->reverse_travel = 0;
+        s->mode = SwipeWaiting;
+        s->waiting_since = now;
+        return e;
+    }
     // An edge gesture that never opened a Dock segment must not deliver an
     // orphan End. Even End(0,0) can make the Dock bounce back on macOS 27.
     if (!was_open && (s->edge_blocked || s->mode == SwipeFailed)) return swipe_drop(e);
@@ -241,7 +350,7 @@ static inline SwipeEvent swipe_finish(Swipe *s, SwipeEvent e, double now) {
     }
     if (!isfinite(e.velocity)) e.velocity = 0;
     double direction = 0;
-    if (fabs(e.velocity) >= ISS_FLICK_VELOCITY)
+    if (e.velocity != 0 && fabs(e.velocity) >= ISS_FLICK_VELOCITY)
         direction = copysign(1, e.velocity);
     else if (fabs(s->position) >= 0.5)
         direction = copysign(1, s->position);

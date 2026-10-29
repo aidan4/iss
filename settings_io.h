@@ -7,7 +7,8 @@
 
 // Atomic writers replace the file, so each read sees one complete revision.
 // A malformed file preserves the current settings. Missing/invalid individual
-// fields use defaults. No values can bypass the engine's supported ranges.
+// fields use defaults. Numeric domains are shared with the app; slider ranges
+// do not clamp values entered in a text field.
 static inline bool settings_read(const char *path, ISSSettings *result) {
     FILE *file = fopen(path, "rb");
     if (!file) return false;
@@ -23,12 +24,12 @@ static inline bool settings_read(const char *path, ISSSettings *result) {
     if (!plist) return false;
     if (CFGetTypeID(plist) != CFDictionaryGetTypeID()) { CFRelease(plist); return false; }
     ISSSettings candidate = iss_defaults;
-#define ISS_READ(name, value, low, high) { \
+#define ISS_READ(name, value, low, high, domain) { \
     CFTypeRef item = CFDictionaryGetValue((CFDictionaryRef)plist, CFSTR(#name)); \
     double number; \
     if (item && CFGetTypeID(item) == CFNumberGetTypeID() && \
-        CFNumberGetValue(item, kCFNumberDoubleType, &number) && isfinite(number)) \
-        candidate.name = fmax(low, fmin(high, number)); \
+        CFNumberGetValue(item, kCFNumberDoubleType, &number) && settings_value_valid(number, domain)) \
+        candidate.name = number; \
 }
     ISS_SETTINGS(ISS_READ)
 #undef ISS_READ
@@ -39,9 +40,9 @@ static inline bool settings_read(const char *path, ISSSettings *result) {
 static inline void settings_print_schema(void) {
     const char *separator = "";
     printf("{\n");
-#define ISS_PRINT(name, value, low, high) \
-    printf("%s  \"%s\": {\"defaultValue\": %.8g, \"minimum\": %.8g, \"maximum\": %.8g}", \
-           separator, #name, (double)value, (double)low, (double)high); separator = ",\n";
+#define ISS_PRINT(name, value, low, high, domain) \
+    printf("%s  \"%s\": {\"defaultValue\": %.8g, \"minimum\": %.8g, \"maximum\": %.8g, \"domain\": \"%s\"}", \
+           separator, #name, (double)value, (double)low, (double)high, settings_domain_name(domain)); separator = ",\n";
     ISS_SETTINGS(ISS_PRINT)
 #undef ISS_PRINT
     printf("\n}\n");

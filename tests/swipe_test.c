@@ -163,13 +163,13 @@ int main(void) {
     }
     // Addition/removal (including removing the last target) invalidates the
     // whole animation, rather than recomputing a different destination.
-    assert(slide_context_valid(1,2,3,1,3));
-    assert(slide_context_valid(1,2,3,2,3));
-    assert(!slide_context_valid(1,2,3,1,4));
-    assert(!slide_context_valid(1,2,3,1,2));
-    assert(!slide_context_valid(1,2,3,0,3));
-    assert(!slide_context_valid(2,3,3,2,3));
-    assert(!slide_context_valid(0,-1,3,0,3));
-    assert(!slide_context_valid(0,1,1,0,1));
+    assert(slide_context_valid(1,2,3,1,3, false));
+    assert(slide_context_valid(1,2,3,2,3, false));
+    assert(!slide_context_valid(1,2,3,1,4, false));
+    assert(!slide_context_valid(1,2,3,1,2, false));
+    assert(!slide_context_valid(1,2,3,0,3, false));
+    assert(!slide_context_valid(2,3,3,2,3, false));
+    assert(!slide_context_valid(0,-1,3,0,3, false));
+    assert(!slide_context_valid(0,1,1,0,1, false));
     puts("swipe state tests passed");
 }

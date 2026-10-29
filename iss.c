@@ -22,6 +22,8 @@
 #include "native_event.h"
 #include "iohid.h"
 #include "slide.h"
+#include "slide_commit.h"
+#include "release_segment.h"
 
 extern int CGSMainConnectionID(void);
 extern CFArrayRef CGSCopyManagedDisplaySpaces(int cid);
@@ -35,6 +37,8 @@ typedef struct {
 
 static CFMachPortRef tap;
 static Swipe swipe;
+static ReleaseSegment release_segment;
+static double release_posted_sign = 1;
 static SpaceInfo spaces = { .index = -1 };
 static bool tap_trusted, tap_enabled, probe, verbose, suppressCompanion;
 static double inputSign, nextSpaceCheck;
@@ -44,6 +48,8 @@ static bool macOS27;
 static const int64_t animationTag = 0x495353534c494445LL;
 static struct {
     CGEventRef source, companion, cleanup;
+    CGEventRef *finish_frames;
+    int finish_count;
     CFRunLoopTimerRef timer;
     double started, from, target, posted_sign;
 } animation;
@@ -146,6 +152,7 @@ static bool same_space_list(SpaceInfo a, SpaceInfo b) {
 
 static void reset_gesture_state(void) {
     swipe = (Swipe){0};
+    release_segment = (ReleaseSegment){0};
     suppressCompanion = false;
 }
 
@@ -169,22 +176,78 @@ static void trace_event(const char *kind, SwipeEvent e) {
 
 // Timer frames are marked after serialization, because userData does not
 // survive the raw-payload round trip. Only our own frames bypass the tap.
-static bool post_slide_frame(CGEventRef source, enum SwipePhase phase,
-                             double progress, double velocity) {
+static CGEventRef create_gesture_frame(CGEventRef source, enum SwipePhase phase,
+                             double progress, double velocity, double posted_sign) {
     CGEventRef frame = CGEventCreateCopy(source);
-    if (!frame) return false;
+    if (!frame) return NULL;
     double original_p = CGEventGetDoubleValueField(frame, kProgress);
     double original_v = CGEventGetDoubleValueField(frame, kVelocityX);
     CGEventSetTimestamp(frame, (CGEventTimestamp)(now_seconds() * 1e9));
     CGEventSetIntegerValueField(frame, kPhase, phase);
-    CGEventSetDoubleValueField(frame, kProgress, progress * animation.posted_sign);
-    CGEventSetDoubleValueField(frame, kVelocityX, velocity * animation.posted_sign);
+    CGEventSetDoubleValueField(frame, kProgress, progress * posted_sign);
+    CGEventSetDoubleValueField(frame, kVelocityX, velocity * posted_sign);
     CGEventSetDoubleValueField(frame, kVelocityY, 0);
     double payload_sign = rawSign;
     CGEventRef synced = sync_native_payload(frame, original_p, original_v, &payload_sign);
     if (synced) { CFRelease(frame); frame = synced; }
-    else if (macOS27) { CFRelease(frame); return false; }
+    else if (macOS27) { CFRelease(frame); return NULL; }
     CGEventSetIntegerValueField(frame, kCGEventSourceUserData, animationTag);
+    return frame;
+}
+
+static CGEventRef create_slide_frame(CGEventRef source, enum SwipePhase phase,
+                                     double progress, double velocity) {
+    return create_gesture_frame(source, phase, progress, velocity, animation.posted_sign);
+}
+
+static double gesture_posted_sign(void) {
+    if (!macOS27) return 1;
+    CFPropertyListRef natural = CFPreferencesCopyAppValue(
+        CFSTR("com.apple.swipescrolldirection"), kCFPreferencesAnyApplication);
+    bool enabled = !natural || CFEqual(natural, kCFBooleanTrue);
+    if (natural) CFRelease(natural);
+    return enabled ? -1 : 1;
+}
+
+// Native previews and timed frames use the same local coordinate system.
+// Posting through this tap preserves the order of boundary End/Begin phases.
+static bool post_release_preview(CGEventTapProxy proxy, CGEventRef source, SwipeEvent output) {
+    int capacity = 3*swipe.count + 6;
+    SwipeEvent *plan = calloc((size_t)capacity, sizeof(*plan));
+    CGEventRef *frames = calloc((size_t)capacity, sizeof(*frames));
+    CGEventRef companion = CGEventCreate(NULL);
+    bool success = false;
+    if (!plan || !frames || !companion) goto done;
+    CGEventSetIntegerValueField(companion, kEventType, kGesture);
+    CGEventSetIntegerValueField(companion, kCGEventSourceUserData, animationTag);
+    ReleaseSegment next = release_segment;
+    int count = release_segment_move(&next, swipe.index, swipe.count, output.progress, plan, capacity);
+    if (count < 0) goto done;
+    double sign = release_posted_sign;
+    for (int i=0; i<count; i++) {
+        frames[i] = create_gesture_frame(source, plan[i].phase, plan[i].progress, plan[i].velocity, sign);
+        if (!frames[i]) goto done;
+    }
+    for (int i=0; i<count; i++) {
+        CGEventTapPostEvent(proxy, frames[i]);
+        CGEventTapPostEvent(proxy, companion);
+    }
+    if (verbose && next.index != release_segment.index)
+        fprintf(stderr, "preview crossed from=%d to=%d local=%+.6f\n",
+                release_segment.index+1, next.index+1, next.position);
+    release_segment = next;
+    success = true;
+done:
+    if (frames) { for (int i=0; i<capacity; i++) if (frames[i]) CFRelease(frames[i]); free(frames); }
+    free(plan);
+    if (companion) CFRelease(companion);
+    return success;
+}
+
+static bool post_slide_frame(CGEventRef source, enum SwipePhase phase,
+                             double progress, double velocity) {
+    CGEventRef frame = create_slide_frame(source, phase, progress, velocity);
+    if (!frame) return false;
     CGEventPost(kCGSessionEventTap, frame);
     CGEventPost(kCGSessionEventTap, animation.companion);
     CFRelease(frame);
@@ -196,6 +259,11 @@ static void dispose_slide(void) {
         CFRunLoopTimerInvalidate(animation.timer);
         CFRelease(animation.timer);
     }
+    if (animation.finish_frames) {
+        for (int i = 0; i < animation.finish_count; i++)
+            if (animation.finish_frames[i]) CFRelease(animation.finish_frames[i]);
+        free(animation.finish_frames);
+    }
     if (animation.source) CFRelease(animation.source);
     if (animation.companion) CFRelease(animation.companion);
     if (animation.cleanup) CFRelease(animation.cleanup);
@@ -205,9 +273,15 @@ static void dispose_slide(void) {
 
 static bool slide_still_valid(void) {
     SpaceInfo current = read_spaces(spaces.display);
+    // The Dock can keep reporting the physical gesture's starting Space
+    // until the last native segment ends. Crossed centers are valid lagging
+    // observations, not evidence that the user selected an unrelated Space.
+    int observed = current.index;
+    if (swipe.release_only && observed >= release_segment.low && observed <= release_segment.high)
+        observed = swipe.index;
     bool valid = same_space_list(current, spaces) &&
                  slide_context_valid(swipe.index, swipe.target, swipe.count,
-                                     current.index, current.count);
+                                     observed, current.count, false);
     if (current.display) CFRelease(current.display);
     return valid;
 }
@@ -229,21 +303,27 @@ static void abort_slide(void) {
 static void finish_slide(void) {
     if (!animation.source) return;
     if (!slide_still_valid()) { abort_slide(); return; }
-    // Full visual travel first; then commit with no slow native ease-out.
-    bool drawn = post_slide_frame(animation.source, SwipeChange, animation.target, 0);
-    // The visual position is already at the adjacent-space boundary. Keep
-    // that endpoint on End; resetting it to epsilon can return the Dock to
-    // the origin after the space layout changes. This is FasterSwiper's
-    // segmented commit: full progress plus a minimal nonzero velocity.
-    bool ended = post_slide_frame(animation.source, SwipeEnd,
-                                  animation.target, copysign(1.0 / 65536, animation.target));
+    // Build the entire commit with fresh timestamps before posting any frame.
+    // Allocation failure must not leave half a multi-Space commit posted.
+    for (int i = 0; i < animation.finish_count; i++) {
+        SwipeEvent frame = slide_commit_event(swipe.index, swipe.target, swipe.count, i);
+        animation.finish_frames[i] = create_slide_frame(animation.source, frame.phase, frame.progress, frame.velocity);
+        if (!animation.finish_frames[i]) { abort_slide(); return; }
+    }
+    if (!slide_still_valid()) { abort_slide(); return; }
+    bool returning = swipe.target == swipe.index;
+    for (int i = 0; i < animation.finish_count; i++) {
+        CGEventRef frame = animation.finish_frames[i];
+        CGEventPost(kCGSessionEventTap, frame);
+        CGEventPost(kCGSessionEventTap, animation.companion);
+    }
     if (animation.cleanup)
         post_slide_frame(animation.cleanup, SwipeEnd, 0, 0);
     swipe.waiting_since = now_seconds();
+    if (returning) { swipe.mode = SwipeTracking; swipe.target = -1; }
     if (verbose)
-        fprintf(stderr, "slide finished elapsed_ms=%.1f drawn=%d committed=%d\n",
-                (now_seconds() - animation.started) * 1000, drawn, ended);
-    if (!ended) fprintf(stderr, "iss: failed to commit timed slide\n");
+        fprintf(stderr, "slide finished elapsed_ms=%.1f target=%d commit_frames=%d\n",
+                (now_seconds() - animation.started) * 1000, swipe.target + 1, animation.finish_count);
     dispose_slide();
 }
 
@@ -269,19 +349,16 @@ static bool start_slide(CGEventRef source, SwipeEvent output) {
     CGEventSetIntegerValueField(animation.companion, kEventType, kGesture);
     CGEventSetIntegerValueField(animation.companion, kCGEventSourceUserData, animationTag);
     animation.from = output.progress;
-    animation.target = slide_target(swipe.count, output.velocity);
+    animation.target = (swipe.target - swipe.index) * slide_target(swipe.count, 1);
     animation.started = now_seconds();
-    animation.posted_sign = 1;
-    if (macOS27) {
-        CFPropertyListRef natural = CFPreferencesCopyAppValue(
-            CFSTR("com.apple.swipescrolldirection"), kCFPreferencesAnyApplication);
-        bool enabled = !natural || CFEqual(natural, kCFBooleanTrue);
-        if (natural) CFRelease(natural);
-        animation.posted_sign = enabled ? -1 : 1;
-    }
+    animation.posted_sign = swipe.release_only ? release_posted_sign : gesture_posted_sign();
+    animation.finish_count = slide_commit_count(swipe.index, swipe.target);
+    if (!animation.finish_count) { dispose_slide(); return false; }
+    animation.finish_frames = calloc((size_t)animation.finish_count, sizeof(CGEventRef));
+    if (!animation.finish_frames) { dispose_slide(); return false; }
     // Divide the duration into whole frames so the last tick lands on the
     // deadline rather than rounding a 60 ms animation up to 66.7 ms.
-    double interval = ISS_SLIDE_SECONDS / ceil(ISS_SLIDE_SECONDS * 120);
+    double interval = slide_frame_interval(ISS_SLIDE_SECONDS);
     animation.timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + interval,
                                          interval, 0, 0, slide_tick, NULL);
     if (!animation.timer) { dispose_slide(); return false; }
@@ -374,7 +451,8 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
             SpaceInfo current = read_spaces(spaces.display);
             sameSpaces = same_space_list(spaces, current);
             observedIndex = current.index;
-            if (sameSpaces && swipe.mode == SwipeTracking && observedIndex != swipe.index)
+            if (sameSpaces && swipe.mode == SwipeTracking && observedIndex != swipe.index &&
+                (!swipe.release_only || observedIndex < release_segment.low || observedIndex > release_segment.high))
                 sameSpaces = false;
             if (current.display) CFRelease(current.display);
             nextSpaceCheck = now + 1.0 / 60.0;
@@ -386,7 +464,35 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
             output = swipe_finish(&swipe, input, now);
         }
     }
-    if (!output.drop && output.phase == SwipeEnd && output.velocity != 0 &&
+    if (swipe.release_only && !output.drop) {
+        if (output.phase == SwipeBegin || output.phase == SwipeChange) {
+            if (output.phase == SwipeBegin) {
+                release_segment = release_segment_begin(swipe.index);
+                release_posted_sign = gesture_posted_sign();
+            }
+            if (!post_release_preview(proxy, ev, output)) {
+                swipe.mode = SwipeFailed;
+                output.phase = SwipeCancel;
+                output = swipe_zero(output);
+            } else {
+                if (verbose) { trace_event("input", input); trace_event("preview", output); }
+                suppressCompanion = true;
+                return NULL;
+            }
+        } else if (output.phase == SwipeEnd && swipe.mode == SwipeWaiting) {
+            // The destination was selected in global finger coordinates. The
+            // Dock is now based at the last crossed center; animate only the
+            // unfinished segment from the exact last preview position.
+            output.progress = release_segment.position;
+            swipe.position = output.progress;
+            swipe.index = release_segment.index;
+            if (!release_segment.open && swipe.target == swipe.index) {
+                swipe.mode = SwipeTracking; swipe.target = -1;
+                output = swipe_drop(output);
+            }
+        }
+    }
+    if (!output.drop && output.phase == SwipeEnd && (output.velocity != 0 || swipe.release_only) &&
         swipe.mode == SwipeWaiting && !swipe.passthrough &&
         start_slide(ev, output)) {
         // Animate every committed segment, including continued-drag paging.
@@ -394,6 +500,9 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
         // the visible slide. The timer supplies its terminal event at the animation deadline.
         output.phase = SwipeChange;
         output.velocity = 0;
+        // The preview already emitted this exact position. Do not reintroduce
+        // a physical End relabelled Changed into the synthetic segment stream.
+        if (swipe.release_only) output.drop = true;
     }
     if (swipe.mode == SwipeFailed && output.phase == SwipeEnd) {
         output.phase = SwipeCancel;

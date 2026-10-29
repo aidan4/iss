@@ -40,7 +40,7 @@ int main(void) {
     swipe_accumulate_pending(&s, -.04);
     assert(s.pending_direction == -1); near(s.pending, -.09);
 
-    // Bounds, types, unknown keys, and omitted fields cannot break timing.
+    // Invalid domains/types fall back; valid decimals are not slider-clamped.
     write_file(path, "<plist version=\"1.0\"><dict>"
         "<key>slideSeconds</key><real>-1</real>"
         "<key>spaceDistance</key><real>99</real>"
@@ -49,13 +49,26 @@ int main(void) {
         "<key>flickVelocity</key><real>nan</real>"
         "<key>futureSetting</key><real>123</real></dict></plist>");
     assert(settings_read(path, &result));
-    near(result.slideSeconds, .02); near(result.spaceDistance, .6);
+    near(result.slideSeconds, .06); near(result.spaceDistance, 99);
     near(result.reverseDistance, .04); near(result.initialSeconds, .04);
     near(result.flickVelocity, .08);
     write_file(path, "<plist><array/></plist>");
-    assert(!settings_read(path, &result)); near(result.slideSeconds, .02);
+    assert(!settings_read(path, &result)); near(result.slideSeconds, .06);
     write_file(path, "broken plist");
-    assert(!settings_read(path, &result)); near(result.slideSeconds, .02);
+    assert(!settings_read(path, &result)); near(result.slideSeconds, .06);
+    write_file(path, "<plist><dict>"
+        "<key>slideSeconds</key><real>0.060125</real>"
+        "<key>gestureMultiplier</key><real>7.125</real>"
+        "<key>gestureAcceleration</key><real>1.375</real>"
+        "<key>releaseOnly</key><real>1</real>"
+        "<key>instantFocus</key><real>0.5</real></dict></plist>");
+    assert(settings_read(path, &result));
+    near(result.slideSeconds, .060125); near(result.gestureMultiplier, 7.125);
+    near(result.gestureAcceleration, 1.375);
+    near(result.releaseOnly, 1); near(result.instantFocus, 1);
+    assert(!settings_value_valid(INFINITY, ISSPositive));
+    assert(!settings_value_valid(0, ISSPositive));
+    assert(settings_value_valid(0, ISSNonnegative));
     unlink(path); assert(!settings_read(path, &result));
     iss_settings = iss_defaults;
     near(slide_position(0, 1.5, .06), 1.5);

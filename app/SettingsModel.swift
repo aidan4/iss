@@ -7,6 +7,52 @@ struct SettingSpec: Decodable {
     let defaultValue: Double
     let minimum: Double
     let maximum: Double
+    enum Domain: String, Decodable { case positive, nonnegative, toggle }
+    let domain: Domain
+    func accepts(_ value: Double) -> Bool {
+        guard value.isFinite else { return false }
+        switch domain {
+        case .positive: return value > 0
+        case .nonnegative: return value >= 0
+        case .toggle: return value == 0 || value == 1
+        }
+    }
+    func parse(_ text: String, scale: Double = 1, locale: Locale = .current) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = locale.decimalSeparator == "," ? trimmed.replacingOccurrences(of: ",", with: ".") : trimmed
+        guard scale.isFinite && scale > 0 else { return nil }
+        // Shift the exponent for milliseconds before parsing, so conversion
+        // neither overflows large durations nor loses tiny decimal values.
+        let value: Double?
+        if scale == 1000 { value = shifted(normalized, by: -3).flatMap(Double.init) }
+        else { value = Double(normalized).map { $0 / scale } }
+        guard let value, accepts(value) else { return nil }
+        return value
+    }
+    // Only slider input is quantized. Typed decimals retain their precision.
+    func sliderValue(_ value: Double, scale: Double = 1) -> Double {
+        let digits = scale == 1000 ? 0 : maximum > 1 ? 2 : 4
+        let displayed = min(maximum, max(minimum, value)) * scale
+        let text = String(format: "%.*f", locale: Locale(identifier: "en_US_POSIX"), digits, displayed)
+        return parse(text, scale: scale, locale: Locale(identifier: "en_US_POSIX")) ?? defaultValue
+    }
+    func text(for value: Double, scale: Double = 1, locale: Locale = .current) -> String {
+        let displayed = value * scale
+        let text: String
+        if !displayed.isFinite { text = shifted(String(value), by: 3)! }
+        else if scale == 1000 && parse(String(displayed.rounded()), scale: scale) == value {
+            text = String(format: "%.0f", locale: Locale(identifier: "en_US_POSIX"), displayed)
+        } else { text = String(displayed) }
+        return locale.decimalSeparator == "," ? text.replacingOccurrences(of: ".", with: ",") : text
+    }
+    private func shifted(_ text: String, by shift: Int) -> String? {
+        let parts = text.lowercased().split(separator: "e", omittingEmptySubsequences: false)
+        guard !parts.isEmpty, parts.count <= 2, let exponent = parts.count == 2 ? Int(parts[1]) : 0 else { return nil }
+        let adjusted = exponent.addingReportingOverflow(shift)
+        guard !adjusted.overflow else { return nil }
+        return "\(parts[0])e\(adjusted.partialValue)"
+    }
+    var inputHint: String { domain == .nonnegative ? "Enter zero or a positive number." : "Enter a positive number." }
 }
 
 enum SettingsPage: String, CaseIterable, Identifiable {
@@ -83,8 +129,8 @@ final class SettingsModel: ObservableObject {
             guard let dictionary = plist as? [String: Any] else { throw CocoaError(.propertyListReadCorrupt) }
             for (key, spec) in schema {
                 if let number = dictionary[key] as? NSNumber,
-                   CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite {
-                    loaded[key] = min(spec.maximum, max(spec.minimum, number.doubleValue))
+                   CFGetTypeID(number) != CFBooleanGetTypeID(), spec.accepts(number.doubleValue) {
+                    loaded[key] = number.doubleValue
                 }
             }
         }
@@ -106,10 +152,8 @@ final class SettingsModel: ObservableObject {
         Binding(get: { self.values[key] ?? self.schema[key]!.defaultValue }, set: { self.set(key, $0) })
     }
     func set(_ key: String, _ value: Double) {
-        guard let spec = schema[key], value.isFinite else { return }
-        let clamped = min(spec.maximum, max(spec.minimum, value))
-        guard values[key] != clamped else { return }
-        values[key] = clamped
+        guard let spec = schema[key], spec.accepts(value), values[key] != value else { return }
+        values[key] = value
         saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 180_000_000)

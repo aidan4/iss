@@ -97,12 +97,34 @@ struct SettingsView: View {
         } message: { Text("This restores your 60 ms slide and original gesture tuning. Launch at login and pause settings stay as they are.") }
     }
 
+    private var releaseOnly: Bool { (model.values["releaseOnly"] ?? 0) >= 0.5 }
+
     private var swiping: some View {
         VStack(alignment: .leading, spacing: 18) {
+            card("SWIPE BEHAVIOR") {
+                Picker("Finish the swipe", selection: Binding(
+                    get: { releaseOnly }, set: { model.set("releaseOnly", $0 ? 1 : 0) })) {
+                    Text("During gesture").tag(false)
+                    Text("On release").tag(true)
+                }.pickerStyle(.segmented)
+                Text(releaseOnly
+                     ? "Follow your fingers, then slide to the next Space in the direction of momentum when you lift. Keep dragging to move across more Spaces."
+                     : "Start the slide early and keep moving through Spaces with a long drag.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             SlidePreview(duration: model.values["slideSeconds"] ?? 0.06)
             card("THE SLIDE") {
                 setting("slideSeconds", "Slide duration", "Every space switch plays the full slide. Lower is faster.", milliseconds: true)
             }
+            if releaseOnly {
+                card("FOLLOW YOUR FINGERS") {
+                    setting("gestureMultiplier", "Gesture speed multiplier", "Multiply preview movement while dragging. 1× is normal speed; 2× travels twice as far.", suffix: "×")
+                    Divider()
+                    setting("gestureAcceleration", "Acceleration multiplier", "Boost fast swipes on top of your gesture speed. 0 turns acceleration off; higher values add more boost.")
+                    Text("Reverse to move back through your Spaces. Without momentum, the nearest Space wins. There are no automatic steps or centered pauses.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
             card("THE FIRST SWITCH") {
                 setting("initialDistance", "Activation distance", "How far to drag before the first slide starts. Lower starts sooner.")
                 Divider()
@@ -110,10 +132,16 @@ struct SettingsView: View {
                 Divider()
                 setting("flickVelocity", "Flick threshold", "Minimum release speed for a quick flick. Lower catches gentler flicks.")
             }
+            }
         }
     }
     private var longDrag: some View {
         VStack(alignment: .leading, spacing: 18) {
+            if releaseOnly {
+                Label("Long-drag stepping is off in On release mode. Change the mode in Swiping to use these settings.", systemImage: "hand.draw")
+                    .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Group {
             card("KEEP MOVING") {
                 setting("spaceDistance", "Distance per space", "Travel between continued switches. Higher spreads spaces farther apart.")
                 Divider()
@@ -126,6 +154,7 @@ struct SettingsView: View {
                 Divider()
                 setting("edgeReverseDistance", "Reverse from an edge", "Inward travel to resume after swiping against the first or last space.")
             }
+            }.disabled(releaseOnly)
             Label("Each step uses your slide duration. Edges always stay clamped.", systemImage: "arrow.left.and.right")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
         }
@@ -207,23 +236,25 @@ struct SettingsView: View {
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(.primary.opacity(0.07), lineWidth: 1))
         }
     }
-    private func setting(_ key: String, _ title: String, _ detail: String, milliseconds: Bool = false) -> some View {
+    private func setting(_ key: String, _ title: String, _ detail: String, milliseconds: Bool = false, suffix: String = "") -> some View {
         let spec = model.schema[key]!
-        let value = model.values[key] ?? spec.defaultValue
-        let display = milliseconds ? String(format: "%.0f ms", value * 1000) : String(format: "%.4g", value)
+        let binding = model.binding(key)
         return VStack(alignment: .leading, spacing: 7) {
-            HStack {
+            HStack(alignment: .firstTextBaseline) {
                 Text(title).font(.system(size: 13, weight: .medium))
                 Spacer()
-                Text(display).monospacedDigit().font(.system(size: 12, weight: .semibold)).foregroundStyle(accent)
-                    .padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+                SettingNumberField(value: binding, spec: spec, title: title,
+                                   scale: milliseconds ? 1000 : 1, suffix: milliseconds ? "ms" : suffix)
+                    .id(key)
                 Button { model.set(key, spec.defaultValue) } label: { Image(systemName: "arrow.counterclockwise").font(.system(size: 10)) }
                     .buttonStyle(.borderless).foregroundStyle(.secondary)
                     .help("Reset \(title.lowercased())").accessibilityLabel("Reset \(title)")
             }
-            Slider(value: model.binding(key), in: spec.minimum...spec.maximum, step: milliseconds ? 0.005 : 0.0025)
-                .accessibilityLabel(title).accessibilityValue(display)
+            // The slider offers a convenient range; text entry keeps the exact
+            // value, including valid values outside that range.
+            Slider(value: Binding(get: { min(spec.maximum, max(spec.minimum, binding.wrappedValue)) },
+                                  set: { binding.wrappedValue = spec.sliderValue($0, scale: milliseconds ? 1000 : 1) }), in: spec.minimum...spec.maximum)
+                .accessibilityLabel(title)
             Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -236,6 +267,50 @@ struct SettingsView: View {
             }
             Spacer(minLength: 0)
         }.padding(14).background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct SettingNumberField: View {
+    @Binding var value: Double
+    let spec: SettingSpec
+    let title: String
+    let scale: Double
+    let suffix: String
+    @State private var draft = ""
+    @State private var invalid = false
+    @State private var savedDraft = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            HStack(spacing: 4) {
+                TextField(title, text: $draft)
+                    .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                    .monospacedDigit().font(.system(size: 12)).frame(width: 115)
+                    .focused($focused).onSubmit { commit() }
+                    .onExitCommand { refresh(); focused = false }
+                    .accessibilityLabel(title).help("Enter a decimal value, then press Return or leave the field to save.")
+                if !suffix.isEmpty { Text(suffix).font(.system(size: 11)).foregroundStyle(.secondary) }
+            }
+            if invalid {
+                Text(spec.inputHint).font(.system(size: 10)).foregroundStyle(.red)
+            }
+        }
+        .onAppear { refresh() }
+        .onChange(of: focused) { _, editing in if !editing { commit() } }
+        .onChange(of: value) { _, _ in refresh() }
+    }
+    private func refresh() {
+        draft = spec.text(for: value, scale: scale)
+        savedDraft = draft
+        invalid = false
+    }
+    private func commit() {
+        guard draft != savedDraft else { invalid = false; return }
+        guard let parsed = spec.parse(draft, scale: scale) else { invalid = true; return }
+        value = parsed
+        savedDraft = draft
+        invalid = false
     }
 }
 

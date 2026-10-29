@@ -16,12 +16,18 @@ endif
 LDFLAGS  = -framework ApplicationServices -framework CoreFoundation \
            -Wl,-dead_strip -Wl,-dead_strip_dylibs -Wl,-x
 
-$(BIN): iss.c focus_switch.c focus_switch.h focus_event.h swipe.h native_event.h iohid.h slide.h settings.h settings_io.h runtime_watch.h Makefile
+$(BIN): iss.c focus_switch.c focus_switch.h focus_event.h swipe.h native_event.h iohid.h slide.h slide_commit.h release_segment.h settings.h settings_io.h runtime_watch.h Makefile
 	$(CC) $(CFLAGS) -o $@ iss.c focus_switch.c $(LDFLAGS) -framework Carbon
 
-test: tests/focus_layout_test.c focus_switch.c focus_switch.h tests/runtime_watch_test.c tests/focus_event_test.c runtime_watch.h focus_event.h tests/swipe_test.c tests/native_event_test.c tests/settings_test.c swipe.h native_event.h iohid.h slide.h settings.h settings_io.h
+test: tests/acceleration_test.c tests/native_event_fixture.h tests/slide_adapter_test.c tests/release_swipe_test.c tests/focus_layout_test.c focus_switch.c focus_switch.h tests/runtime_watch_test.c tests/focus_event_test.c runtime_watch.h focus_event.h tests/swipe_test.c tests/native_event_test.c tests/settings_test.c swipe.h native_event.h iohid.h slide.h slide_commit.h release_segment.h settings.h settings_io.h
 	$(CC) $(CFLAGS) -o /tmp/iss-swipe-test tests/swipe_test.c
 	/tmp/iss-swipe-test
+	$(CC) $(CFLAGS) -o /tmp/iss-release-swipe-test tests/release_swipe_test.c
+	/tmp/iss-release-swipe-test
+	$(CC) $(CFLAGS) -o /tmp/iss-acceleration-test tests/acceleration_test.c
+	/tmp/iss-acceleration-test
+	$(CC) $(CFLAGS) -o /tmp/iss-slide-adapter-test tests/slide_adapter_test.c focus_switch.c $(LDFLAGS) -framework Carbon
+	/tmp/iss-slide-adapter-test
 	$(CC) $(CFLAGS) -o /tmp/iss-native-event-test tests/native_event_test.c $(LDFLAGS)
 	/tmp/iss-native-event-test
 	$(CC) $(CFLAGS) -o /tmp/iss-settings-test tests/settings_test.c $(LDFLAGS)
