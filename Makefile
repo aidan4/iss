@@ -16,16 +16,22 @@ endif
 LDFLAGS  = -framework ApplicationServices -framework CoreFoundation \
            -Wl,-dead_strip -Wl,-dead_strip_dylibs -Wl,-x
 
-$(BIN): iss.c swipe.h native_event.h iohid.h slide.h settings.h settings_io.h Makefile
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+$(BIN): iss.c focus_switch.c focus_switch.h focus_event.h swipe.h native_event.h iohid.h slide.h settings.h settings_io.h runtime_watch.h Makefile
+	$(CC) $(CFLAGS) -o $@ iss.c focus_switch.c $(LDFLAGS) -framework Carbon
 
-test: tests/swipe_test.c tests/native_event_test.c tests/settings_test.c swipe.h native_event.h iohid.h slide.h settings.h settings_io.h
+test: tests/focus_layout_test.c focus_switch.c focus_switch.h tests/runtime_watch_test.c tests/focus_event_test.c runtime_watch.h focus_event.h tests/swipe_test.c tests/native_event_test.c tests/settings_test.c swipe.h native_event.h iohid.h slide.h settings.h settings_io.h
 	$(CC) $(CFLAGS) -o /tmp/iss-swipe-test tests/swipe_test.c
 	/tmp/iss-swipe-test
 	$(CC) $(CFLAGS) -o /tmp/iss-native-event-test tests/native_event_test.c $(LDFLAGS)
 	/tmp/iss-native-event-test
 	$(CC) $(CFLAGS) -o /tmp/iss-settings-test tests/settings_test.c $(LDFLAGS)
 	/tmp/iss-settings-test
+	$(CC) $(CFLAGS) -o /tmp/iss-runtime-watch-test tests/runtime_watch_test.c $(LDFLAGS)
+	/tmp/iss-runtime-watch-test
+	$(CC) $(CFLAGS) -o /tmp/iss-focus-event-test tests/focus_event_test.c $(LDFLAGS)
+	/tmp/iss-focus-event-test
+	$(CC) $(CFLAGS) -o /tmp/iss-focus-layout-test tests/focus_layout_test.c $(LDFLAGS) -framework Carbon
+	/tmp/iss-focus-layout-test
 
 lint: iss.c
 	cppcheck --enable=warning,style,performance --error-exitcode=1 iss.c
@@ -81,10 +87,11 @@ build/AppIcon.icns: build/make-icon
 	build/make-icon build/AppIcon.iconset
 	iconutil -c icns build/AppIcon.iconset -o $@
 
-$(APP)/Contents/MacOS/ISS: app/App.swift app/SettingsView.swift app/SettingsModel.swift app/Info.plist build/AppIcon.icns $(BIN) Makefile
+$(APP)/Contents/MacOS/ISS: app/App.swift app/SettingsView.swift app/SettingsModel.swift app/Info.plist THIRD_PARTY_NOTICES.md build/AppIcon.icns $(BIN) Makefile
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	$(SWIFTC) -O -parse-as-library -o $@ app/App.swift app/SettingsView.swift app/SettingsModel.swift -framework AppKit -framework SwiftUI -framework ServiceManagement -framework ApplicationServices
 	cp app/Info.plist $(APP)/Contents/Info.plist
+	cp THIRD_PARTY_NOTICES.md $(APP)/Contents/Resources/THIRD_PARTY_NOTICES.md
 	cp build/AppIcon.icns $(APP)/Contents/Resources/AppIcon.icns
 	cp $(BIN) $(APP)/Contents/MacOS/iss-engine
 	./$(BIN) --settings-schema > $(APP)/Contents/Resources/settings-schema.json

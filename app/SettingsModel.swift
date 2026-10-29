@@ -57,7 +57,9 @@ final class SettingsModel: ObservableObject {
     private let environment: EngineEnvironment
     private var process: Process?
     private var pipe: Pipe?
-    private var poller: Timer?
+    private var permissionRetry: Timer?
+    private var activationObserver: NSObjectProtocol?
+    private var lastSavedValues: [String: Double]?
     private var saveTask: Task<Void, Never>?
     private var quitting = false
     private var stopping = false
@@ -95,16 +97,19 @@ final class SettingsModel: ObservableObject {
         guard !preview else { return }
         refreshSystemStatus()
         if enabled { start() } else { setStatus("Paused") }
-        poller = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshSystemStatus() }
-        }
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in Task { @MainActor in self?.refreshSystemStatus() } }
+        updatePermissionRetry()
     }
     func binding(_ key: String) -> Binding<Double> {
         Binding(get: { self.values[key] ?? self.schema[key]!.defaultValue }, set: { self.set(key, $0) })
     }
     func set(_ key: String, _ value: Double) {
         guard let spec = schema[key], value.isFinite else { return }
-        values[key] = min(spec.maximum, max(spec.minimum, value))
+        let clamped = min(spec.maximum, max(spec.minimum, value))
+        guard values[key] != clamped else { return }
+        values[key] = clamped
         saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 180_000_000)
@@ -114,27 +119,34 @@ final class SettingsModel: ObservableObject {
     }
     func restoreDefaults() {
         saveTask?.cancel()
-        values = schema.mapValues(\.defaultValue)
+        let defaults = schema.mapValues(\.defaultValue)
+        if values != defaults { values = defaults }
         saveReportingError()
     }
     private func save() throws {
-        guard !preview else { return }
+        guard !preview, lastSavedValues != values else { return }
         let data = try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0)
         try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: configURL, options: .atomic)
+        lastSavedValues = values
     }
     private func saveReportingError() {
         do { try save() }
         catch { self.error = "Couldn’t save settings: \(error.localizedDescription)" }
     }
     private func setStatus(_ text: String, running: Bool = false) {
-        status = text; isRunning = running; onStatusChange?()
+        guard status != text || isRunning != running else { return }
+        if status != text { status = text }
+        if isRunning != running { isRunning = running }
+        onStatusChange?()
     }
     func setEnabled(_ value: Bool) {
+        guard enabled != value else { return }
         enabled = value
         if !preview { environment.preferences.set(value, forKey: "switcherEnabled") }
         error = nil
         if value { start() } else { stop() }
+        updatePermissionRetry()
     }
     func start() {
         guard !preview, !quitting, process == nil else { return }
@@ -209,6 +221,9 @@ final class SettingsModel: ObservableObject {
             setStatus("Another ISS is running")
             error = "Stop the Terminal copy of ISS first. If you installed the old background service with make install, run make uninstall in the project folder, then click Retry."
         } else {
+            let trusted = environment.trusted()
+            if accessibility != trusted { accessibility = trusted }
+            updatePermissionRetry()
             setStatus(accessibility ? "Stopped unexpectedly" : "Accessibility needed")
             error = code == 1
                 ? "Allow ISS in System Settings → Privacy & Security → Accessibility, then click Retry. If iss-engine is listed separately, allow it too."
@@ -232,12 +247,29 @@ final class SettingsModel: ObservableObject {
         _ = AXIsProcessTrustedWithOptions(options)
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
-    private func refreshSystemStatus() {
+    private func updatePermissionRetry() {
+        if preview || accessibility || !enabled {
+            permissionRetry?.invalidate(); permissionRetry = nil
+        } else if permissionRetry == nil {
+            // Poll only during permission setup. The normal running app has
+            // no repeating timer; opening its UI refreshes system status.
+            permissionRetry = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.refreshSystemStatus() }
+            }
+            permissionRetry?.tolerance = 0.5
+        }
+    }
+    func refreshSystemStatus() {
+        guard !preview else { return }
         let previouslyTrusted = accessibility
-        accessibility = environment.trusted()
+        let trusted = environment.trusted()
+        if accessibility != trusted { accessibility = trusted }
         let state = SMAppService.mainApp.status
-        loginEnabled = state == .enabled || state == .requiresApproval
-        loginNeedsApproval = state == .requiresApproval
+        let login = state == .enabled || state == .requiresApproval
+        let approval = state == .requiresApproval
+        if loginEnabled != login { loginEnabled = login }
+        if loginNeedsApproval != approval { loginNeedsApproval = approval }
+        updatePermissionRetry()
         if !accessibility && enabled { setStatus("Accessibility needed") }
         if accessibility && !previouslyTrusted && enabled {
             if process == nil { error = nil; start() } else { setStatus("Active", running: true) }
@@ -259,7 +291,8 @@ final class SettingsModel: ObservableObject {
         NSPasteboard.general.setString(report, forType: .string)
     }
     func shutdown() {
-        quitting = true; saveTask?.cancel(); poller?.invalidate()
+        quitting = true; saveTask?.cancel(); permissionRetry?.invalidate()
+        if let activationObserver { NotificationCenter.default.removeObserver(activationObserver) }
         saveReportingError()
         if let process, process.isRunning { process.terminate() }
         // The engine finishes its current slide and removes its tap on SIGTERM.

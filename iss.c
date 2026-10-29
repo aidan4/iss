@@ -17,6 +17,8 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include "settings_io.h"
+#include "runtime_watch.h"
+#include "focus_switch.h"
 #include "native_event.h"
 #include "iohid.h"
 #include "slide.h"
@@ -46,7 +48,13 @@ static struct {
     double started, from, target, posted_sign;
 } animation;
 static bool sameSpaces;
-static volatile sig_atomic_t running = 1;
+static double last_user_gesture;
+static bool permission_lost;
+static double now_seconds(void);
+static bool gesture_busy(void) {
+    return swipe.active || animation.source || now_seconds() - last_user_gesture < 0.25;
+}
+
 
 static double now_seconds(void) {
     static mach_timebase_info_data_t timebase;
@@ -192,6 +200,7 @@ static void dispose_slide(void) {
     if (animation.companion) CFRelease(animation.companion);
     if (animation.cleanup) CFRelease(animation.cleanup);
     memset(&animation, 0, sizeof(animation));
+    CFRunLoopStop(CFRunLoopGetMain());
 }
 
 static bool slide_still_valid(void) {
@@ -290,6 +299,11 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
         if (swipe.active && !swipe.passthrough) swipe.mode = SwipeFailed;
         else reset_gesture_state();
         tap_enabled = AXIsProcessTrusted();
+        if (tap_enabled != tap_trusted) {
+            tap_trusted = tap_enabled;
+            permission_lost = !tap_enabled;
+            fprintf(stderr, "iss: Accessibility %s\n", tap_enabled ? "restored" : "removed");
+        }
         if (tap_enabled) finish_slide(); else dispose_slide();
         CGEventTapEnable(tap, tap_enabled);
         return ev;
@@ -302,6 +316,10 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
         return !probe && suppress ? NULL : ev;
     }
     if (et != kDockControl) return ev;
+    if (!probe) {
+        last_user_gesture = now_seconds();
+        focus_switch_cancel();
+    }
     if (CGEventGetIntegerValueField(ev, kHIDType) != kDockSwipe ||
         CGEventGetIntegerValueField(ev, kMotion) != kHorizontal) {
         suppressCompanion = false;
@@ -396,8 +414,6 @@ static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, voi
     return edited;
 }
 
-static void stop(int signal_number) { (void)signal_number; running = 0; }
-
 #ifndef ISS_TEST
 int main(int argc, char **argv) {
     const char *config_path = NULL;
@@ -408,6 +424,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--verbose")) verbose = true;
         else if (!strcmp(argv[i], "--managed")) managed = true;
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) config_path = argv[++i];
+        else if (!strcmp(argv[i], "--focus-check")) {
+            bool available = focus_switch_available();
+            printf("Focus transition APIs: %s\n", available ? "available" : "unavailable");
+            return available ? 0 : 1;
+        }
         else if (!strcmp(argv[i], "--settings-schema")) { settings_print_schema(); return 0; }
         else {
             fprintf(stderr, "Usage: iss [--verbose | --probe] [--config settings.plist]\n"
@@ -449,39 +470,38 @@ int main(int argc, char **argv) {
     CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
     CGEventTapEnable(tap, true);
     tap_trusted = tap_enabled = true;
-    signal(SIGINT, stop); signal(SIGTERM, stop);
+    RuntimeWatch watch;
+    if (!runtime_watch_open(&watch, config_path, managed ? parent : 0, true)) {
+        fprintf(stderr, "iss: failed to install runtime notifications\n");
+        CGEventTapEnable(tap, false);
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+        CFRelease(source); CFRelease(tap); close(lock);
+        return 1;
+    }
+    if (!probe && !focus_switch_start(macOS27, animationTag, gesture_busy, verbose))
+        fprintf(stderr, "iss: instant focus unavailable on this macOS version\n");
+    if (!probe) focus_switch_enable(iss_settings.instantFocus >= 0.5);
     fprintf(stderr, "iss: %s (macOS %s, native event path)\n",
             probe ? "read-only gesture probe" : "swipe active", version);
-    double next_settings_check = 0;
-    while (running) {
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, true);
-        if (managed && getppid() != parent) break;
-        // Freeze the settings for the entire physical gesture and its final
-        // animation. In particular, never change the timer duration mid-slide.
-        double now = now_seconds();
-        if (config_path && !swipe.active && !animation.source && now >= next_settings_check) {
+    while (!watch.stop_requested && !permission_lost) {
+        // Freeze settings through the physical gesture and its final slide.
+        // No idle polling: the directory watcher marks actual edits dirty.
+        if (config_path && watch.settings_dirty && !swipe.active && !animation.source) {
             ISSSettings updated;
             if (settings_read(config_path, &updated)) iss_settings = updated;
-            next_settings_check = now + 0.25;
+            watch.settings_dirty = false;
+            if (!probe) focus_switch_enable(iss_settings.instantFocus >= 0.5);
         }
-        trusted = AXIsProcessTrusted();
-        if (trusted != tap_trusted) {
-            dispose_slide();
-            reset_gesture_state();
-            tap_trusted = trusted;
-            fprintf(stderr, "iss: Accessibility %s\n", trusted ? "restored" : "removed");
-        }
-        if (trusted != tap_enabled) {
-            CGEventTapEnable(tap, trusted);
-            tap_enabled = trusted;
-        }
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1e10, true);
     }
+    runtime_watch_close(&watch);
+    focus_switch_stop();
     finish_slide();
     CGEventTapEnable(tap, false);
     CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
     CFRelease(source); CFRelease(tap);
     if (spaces.display) CFRelease(spaces.display);
     close(lock);
-    return 0;
+    return permission_lost ? 1 : 0;
 }
 #endif

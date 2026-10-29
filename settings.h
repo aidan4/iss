@@ -12,7 +12,8 @@
     X(reverseDistance,      0.040,  0.015, 0.150) \
     X(edgeReverseDistance,  0.040,  0.015, 0.150) \
     X(flickVelocity,        0.080,  0.020, 0.400) \
-    X(longSeconds,          0.180,  0.060, 0.500)
+    X(longSeconds,          0.180,  0.060, 0.500) \
+    X(instantFocus,         1.0,    0.0,   1.0)
 
 typedef struct {
 #define ISS_FIELD(name, value, low, high) double name;

@@ -50,7 +50,7 @@ The settings window has three pages:
 
 - **Swiping:** slide duration, activation distance and delay, and flick sensitivity. Try Slide previews the timing without changing your desktop.
 - **Long drags:** distance per space, centered pause, long-drag delay, reversal distance, and inward reversal distance at an edge.
-- **General:** launch at login, Accessibility permission, switcher status, restart, and local diagnostics.
+- **General:** instant focus across Spaces, launch at login, Accessibility permission, switcher status, restart, and local diagnostics.
 
 Changes save automatically and apply between physical gestures, after any current slide finishes. Every setting has a reset button; Restore Defaults returns to the tuning above. Closing the window leaves ISS in the menu bar. The menu offers pause/resume, settings, launch at login, Accessibility settings, and quit. Pausing or quitting returns gestures to macOS.
 
@@ -67,6 +67,16 @@ Stop any foreground `./iss` process with Ctrl+C before opening the app. The new 
 Enable **Launch at login** in the app once it is in its permanent location. ISS uses macOS’s built-in login-item registration. If approval is required, the app provides a link to Login Items. Turn this setting off before moving or removing the app.
 
 Settings are saved in `~/Library/Application Support/ISS/settings.plist`. The app and engine share their default values and supported ranges through `settings.h`; the app’s schema is generated during the build. The helper validates the file and defers reloads throughout a gesture and its animation. It exits if the app quits or crashes. The app stays offline and does not send diagnostics automatically.
+
+Normal background operation has no repeating status or settings-file poll. The engine waits on kernel notifications for file edits, app exit, and termination signals. The UI refreshes system status when opened/activated and publishes only actual changes. A two-second permission retry runs only while Accessibility is missing. Timers run only during a swipe, a short pending focus request, or cursor restoration after a cross-display jump.
+
+### Instant app and window focus
+
+**General → Instant focus across Spaces** is enabled by default. It skips the native Space transition when Command+Tab, the AltTab app, an existing Option+Tab shortcut, or a Dock click focuses a window on another Space. Your switcher still chooses the destination; ISS does not bind Option+Tab or replace its UI, and cannot remove a delay inside a third-party switcher's own interface. Windows already on a visible Space are left alone.
+
+This uses yabai's [SIP-compatible focus approach](https://github.com/asmvik/yabai/blob/master/src/space_manager.c), with synthetic gestures carrying the macOS 27 IOHID payload. No Dock injection or SIP changes are used. The focus observer coalesces activation and window-focus notifications, reads the actual focused window, and rechecks both focus and the ordered Space layout immediately before posting. It prepares the complete jump up front and ignores duplicate requests; it never appends extra steps based on a Space query during the native transition. A physical swipe cancels any pending request. If focus or the layout changes during preparation, it leaves the switch to macOS. Trackpad gestures keep the configured slide duration. On another display, the cursor is briefly routed to that display and restored if you have not moved it.
+
+The underlying APIs are private; compatibility and perceived timing require live testing on each macOS version. Run `./iss --focus-check` to check symbol availability without changing focus. See `THIRD_PARTY_NOTICES.md` for reference code licences.
 
 For a UI-only preview with no switcher or Accessibility prompt:
 

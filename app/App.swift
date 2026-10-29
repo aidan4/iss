@@ -85,7 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self; menu.addItem(item); return item
     }
-    func menuWillOpen(_ menu: NSMenu) { updateMenu() }
+    func menuWillOpen(_ menu: NSMenu) { model.refreshSystemStatus(); updateMenu() }
     private func updateMenu() {
         statusLine.title = "ISS · \(model.status)"
         toggleItem.title = model.enabled ? "Pause ISS" : "Resume ISS"
@@ -94,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.appearsDisabled = !model.isRunning
     }
     @objc func showSettings() {
+        model.refreshSystemStatus()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

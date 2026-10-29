@@ -132,6 +132,22 @@ struct SettingsView: View {
     }
     private var general: some View {
         VStack(alignment: .leading, spacing: 18) {
+            card("WINDOW SWITCHING") {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Instant focus across Spaces").fontWeight(.medium)
+                        Text("Skip the Space animation when Command+Tab, AltTab, or an existing Option+Tab shortcut focuses a window.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Toggle("Instant focus across Spaces", isOn: Binding(
+                        get: { (model.values["instantFocus"] ?? 1) >= 0.5 },
+                        set: { model.set("instantFocus", $0 ? 1 : 0) }))
+                        .labelsHidden().toggleStyle(.switch)
+                }
+                Text("Keeps your current switcher and trackpad slide timing. Works with SIP enabled.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
             card("ON YOUR MAC") {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {

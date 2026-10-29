@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 @main
 struct SettingsModelTests {
@@ -58,6 +59,16 @@ struct SettingsModelTests {
         await wait { runtime.isRunning }
         let pidFile = URL(fileURLWithPath: config.path + ".pid")
         let firstPID = Int32(try String(contentsOf: pidFile, encoding: .utf8))!
+        var publications = 0
+        let subscription = runtime.objectWillChange.sink { publications += 1 }
+        for _ in 0..<10 { runtime.refreshSystemStatus() }
+        assert(publications == 0, "Unchanged status must not invalidate the UI")
+        let before = try FileManager.default.attributesOfItem(atPath: config.path)[.modificationDate] as! Date
+        runtime.set("slideSeconds", runtime.values["slideSeconds"]!)
+        try await Task.sleep(nanoseconds: 350_000_000)
+        let after = try FileManager.default.attributesOfItem(atPath: config.path)[.modificationDate] as! Date
+        assert(before == after, "Unchanged settings must not rewrite the file")
+        subscription.cancel()
         runtime.setEnabled(false)
         await wait { runtime.status == "Paused" }
         assert(kill(firstPID, 0) == -1)
